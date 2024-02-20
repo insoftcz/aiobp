@@ -108,6 +108,8 @@ def set_options(config: Annotated, values: ConfigMap, path: Optional[list[str]] 
             value = set_options(option_type(), values.get(option_name), path)
         else:
             value = values.get(option_name)
+            if isinstance(value, ConfigOption):  # option was not set by configuration file loader
+                value = value.value
             if isinstance(value, Exception):
                 raise InvalidConfigFile(f'missing option "{option_name}" in section "{".".join(path)}"') from value
 

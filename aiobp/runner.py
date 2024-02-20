@@ -58,14 +58,18 @@ def log_awaitable(awaitable: Union[asyncio.Task, Coroutine]) -> str:
 
 
 # Needed up to Python 3.10, when we upgrade to Python 3.11 we can use builtin asyncio.run()
-def runner(service: Coroutine, shutdown_timeout: float = 5.0) -> None:
-    """Run given service in asyncio.Task and handle SIGTERM/KeyboardInterrupt"""
+def runner(service: Coroutine, shutdown_timeout=5.0, endless=True) -> None:
+    """Run given service in asyncio.Task and handle SIGTERM/KeyboardInterrupt
+
+    If endless is set to False then runner shutdown immediately after srvice
+    coroutine finishes; otherwise the service is kept running.
+    """
     loop = asyncio.get_event_loop()
     # main does:
     # 1. start given service coroutine as task
     # 2. add SIGTERM and SIGINT handlers
     # 3. waits for kill or KeyboardInterrupt
-    loop.run_until_complete(__main(service))
+    loop.run_until_complete(__main(service, endless))
     # graceful_shutdown does:
     # 1. calls one by one all registered coroutines via on_shutdown(...) in LIFO order
     # 2. cancel all tasks in parallel (via gather)
@@ -74,19 +78,29 @@ def runner(service: Coroutine, shutdown_timeout: float = 5.0) -> None:
     loop.run_until_complete(__graceful_shutdown(shutdown_timeout))
 
 
-async def __main(service: Coroutine) -> None:
-    """Run main service in task and await for SIGTERM"""
-    create_task(service, "MainTask")
-
+async def __shutdown():
+    """Wait for CTRL+C or SIGTERM"""
     shutdown_event = asyncio.Event()
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
     loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
-    # endless wait for shutdown
     try:
         await shutdown_event.wait()
     except asyncio.CancelledError:
         pass
+
+
+async def __main(service: Coroutine, endless: bool) -> None:
+    """Run main service in task"""
+    main_task = create_task(service, "MainTask")
+
+    if endless:  # endless wait for interrupt
+        await __shutdown()
+    else:  # wait for service coroutine to finish or interrupt
+        await asyncio.wait(
+            [main_task, create_task(__shutdown(), name='Shutdown')],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
 
 
 async def __graceful_shutdown(timeout: float = 5.0) -> None:

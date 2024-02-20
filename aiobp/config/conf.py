@@ -2,19 +2,21 @@
 
 import configparser
 
-from typing import Annotated, Type
+from typing import Annotated, Optional, Type
 
 from .annotations import ConfigOption, get_options, set_options
 from .exceptions import InvalidConfigImplementation
 
 
-def loader(filename: str, config_class: Type[Annotated]) -> Annotated:
+def loader(config_class: Type[Annotated], filename: Optional[str] = None) -> Annotated:
     """INI like configuration loader"""
-    conf = configparser.ConfigParser()
-    conf.read(filename)
-
     config = get_options(config_class)
 
+    if filename is None:
+        return set_options(config_class(), config)
+
+    conf = configparser.ConfigParser()
+    conf.read(filename)
     for section_name, options in config.items():
         if not isinstance(options, dict):
             raise InvalidConfigImplementation(f'Class "{config_class.__name__}" can\'t have direct option "{section_name}"')
@@ -23,11 +25,11 @@ def loader(filename: str, config_class: Type[Annotated]) -> Annotated:
             if not isinstance(option, ConfigOption):
                 raise InvalidConfigImplementation(f'"{section_name}" can have only scalar attributes, not subsection "{option_name}"')
 
-            if isinstance(option.type, int):
+            if option.type is int:
                 get = conf.getint
-            elif isinstance(option.type, float):
+            elif option.type is float:
                 get = conf.getfloat
-            elif isinstance(option.type, bool):
+            elif option.type is bool:
                 get = conf.getboolean
             else:
                 get = conf.get

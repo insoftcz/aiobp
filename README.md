@@ -81,7 +81,7 @@ def main():
     add_devel_log_level()
     try:
         config_filename = sys_argv_or_filenames('service.local.conf', 'service.conf')
-        config = loader(config_filename, Config)
+        config = loader(Config, config_filename)
     except InvalidConfigFile as error:
         print(f'Invalid configuration: {error}')
         sys.exit(1)
