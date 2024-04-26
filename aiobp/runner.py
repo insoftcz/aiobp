@@ -69,7 +69,10 @@ def runner(service: Coroutine, shutdown_timeout=5.0, endless=True) -> None:
     # 1. start given service coroutine as task
     # 2. add SIGTERM and SIGINT handlers
     # 3. waits for kill or KeyboardInterrupt
-    loop.run_until_complete(__main(service, endless))
+    try:
+        loop.run_until_complete(__main(service, endless))
+    except Exception:
+        log.critical("Unhandled exception in service")
     # graceful_shutdown does:
     # 1. calls one by one all registered coroutines via on_shutdown(...) in LIFO order
     # 2. cancel all tasks in parallel (via gather)

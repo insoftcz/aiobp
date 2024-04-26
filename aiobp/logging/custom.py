@@ -4,7 +4,7 @@ import logging
 import logging.handlers
 import sys
 
-from typing import Optional
+from typing import Optional, Type, TracebackType
 
 
 class LoggingConfig:
@@ -82,6 +82,15 @@ def add_devel_log_level():
     logging.addLevelName(1, "DEVEL")
 
 
+def log_unhandled_exception(type_: Type[BaseException], value: BaseException, traceback: TracebackType):
+    """Log unhandled exceptions"""
+    if issubclass(type_, KeyboardInterrupt):
+        sys.__excepthook__(type_, value, traceback)
+        return
+
+    logging.critical("Uncaught exception", exc_info=(type_, value, traceback))
+
+
 def setup_logging(config: Optional[LoggingConfig] = LoggingConfig()) -> None:
     """Setup Python logger"""
     console_handler = logging.StreamHandler(sys.stdout)
@@ -90,11 +99,13 @@ def setup_logging(config: Optional[LoggingConfig] = LoggingConfig()) -> None:
     )
     handlers = [console_handler]
 
-    if config.filename is not None:
+    if config and config.filename is not None:
         file_handler = logging.handlers.WatchedFileHandler(filename=config.filename)
         file_handler.setFormatter(
             PrefixExceptionFormatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"),
         )
         handlers.append(file_handler)
 
-    logging.basicConfig(level=config.level, handlers=handlers)
+    logging.basicConfig(level=config.level if config else None, handlers=handlers)
+
+    sys.excepthook = log_unhandled_exception
