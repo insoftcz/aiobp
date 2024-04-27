@@ -4,7 +4,8 @@ import logging
 import logging.handlers
 import sys
 
-from typing import Optional, Type, TracebackType
+from types import TracebackType
+from typing import Optional, Type
 
 
 class LoggingConfig:

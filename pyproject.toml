@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "aiobp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Boilerplate for asyncio service"
 authors = ["INSOFT s.r.o."]
 readme = "README.md"
