@@ -1,15 +1,16 @@
-"""Load configuration from JSON file"""
+"""Load configuration from YAML file"""
 
-import json
 from pathlib import Path
 from typing import Annotated, Optional, get_origin
+
+import yaml
 
 from .annotations import ConfigOption, get_options, parse_list, set_options
 from .exceptions import InvalidConfigFile, InvalidConfigImplementation
 
 
 def loader(config_class: type[Annotated], filename: Optional[str] = None) -> Annotated:
-    """Load configuration from JSON file"""
+    """Load configuration from YAML file"""
     config = get_options(config_class)
 
     if filename is None:
@@ -17,10 +18,10 @@ def loader(config_class: type[Annotated], filename: Optional[str] = None) -> Ann
 
     file = Path(filename)
     with file.open(encoding="utf-8") as fp:
-        conf = json.load(fp)
+        conf = yaml.safe_load(fp)
 
     if not isinstance(conf, dict):
-        error = "JSON configuration structure must be dict[str, dict[str, any]]"
+        error = "YAML configuration structure must be dict[str, dict[str, any]]"
         raise InvalidConfigFile(error)
 
     for section_name, options in config.items():

@@ -1,14 +1,13 @@
 """INI like configuration loader"""
 
 import configparser
+from typing import Annotated, Optional, get_origin
 
-from typing import Annotated, Optional, Type
-
-from .annotations import ConfigOption, get_options, set_options
+from .annotations import ConfigOption, get_options, parse_list, set_options
 from .exceptions import InvalidConfigImplementation
 
 
-def loader(config_class: Type[Annotated], filename: Optional[str] = None) -> Annotated:
+def loader(config_class: type[Annotated], filename: Optional[str] = None) -> Annotated:
     """INI like configuration loader"""
     config = get_options(config_class)
 
@@ -19,11 +18,13 @@ def loader(config_class: Type[Annotated], filename: Optional[str] = None) -> Ann
     conf.read(filename)
     for section_name, options in config.items():
         if not isinstance(options, dict):
-            raise InvalidConfigImplementation(f'Class "{config_class.__name__}" can\'t have direct option "{section_name}"')
+            error = f'Class "{config_class.__name__}" can\'t have direct option "{section_name}"'
+            raise InvalidConfigImplementation(error)
 
         for option_name, option in options.items():
             if not isinstance(option, ConfigOption):
-                raise InvalidConfigImplementation(f'"{section_name}" can have only scalar attributes, not subsection "{option_name}"')
+                error = f'"{section_name}" can have only scalar attributes, not subsection "{option_name}"'
+                raise InvalidConfigImplementation(error)
 
             if option.type is int:
                 get = conf.getint
@@ -34,6 +35,8 @@ def loader(config_class: Type[Annotated], filename: Optional[str] = None) -> Ann
             else:
                 get = conf.get
 
-            options[option_name] = get(section_name, option_name, fallback=option.value)
+            value = get(section_name, option_name, fallback=option.value)
+
+            options[option_name] = parse_list(option.type, value) if get_origin(option.type) is list else value
 
     return set_options(config_class(), config)

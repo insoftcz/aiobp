@@ -3,7 +3,6 @@
 import functools
 import logging
 
-
 dev = functools.partial(logging.log, 1)
 debug = logging.debug
 info = logging.info

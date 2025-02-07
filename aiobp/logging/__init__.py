@@ -1,3 +1,5 @@
+"""Logger with color support"""
+
 from . import log
 from .custom import LoggingConfig, add_devel_log_level, setup_logging
 

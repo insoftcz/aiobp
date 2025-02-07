@@ -3,15 +3,14 @@
 import logging
 import logging.handlers
 import sys
-
 from types import TracebackType
-from typing import Optional, Type
+from typing import ClassVar, Optional
 
 
 class LoggingConfig:
     """Loging configuration"""
 
-    level: str = 'DEBUG'
+    level: str = "DEBUG"
     filename: Optional[str] = None
 
 
@@ -47,13 +46,13 @@ class PrefixExceptionFormatter(logging.Formatter):
 class ColorFormatter(PrefixExceptionFormatter):
     """Color formatter for console logging"""
 
-    severity_color = {
+    severity_color: ClassVar[dict[int, str]] = ({
         logging.DEBUG: Color.grey,
         logging.INFO: Color.white,
         logging.WARNING: Color.orange,
         logging.ERROR: Color.red,
         logging.CRITICAL: Color.magenta,
-    }
+    })
 
     def format(self, record: logging.LogRecord) -> str:
         """Format message according to its severity level"""
@@ -62,11 +61,10 @@ class ColorFormatter(PrefixExceptionFormatter):
         if self.usesTime():
             record.asctime = self.formatTime(record, self.datefmt)
         s = self.formatMessage(record)
-        if record.exc_info:
+        if record.exc_info and not record.exc_text:
             # Cache the traceback text to avoid converting it multiple times
             # (it's constant anyway)
-            if not record.exc_text:
-                record.exc_text = self.formatException(record.exc_info)
+            record.exc_text = self.formatException(record.exc_info)
         if record.exc_text:
             if s[-1:] != "\n":
                 s = s + "\n"
@@ -78,12 +76,12 @@ class ColorFormatter(PrefixExceptionFormatter):
         return s
 
 
-def add_devel_log_level():
+def add_devel_log_level() -> None:
     """Register new logging level for development purposes"""
     logging.addLevelName(1, "DEVEL")
 
 
-def log_unhandled_exception(type_: Type[BaseException], value: BaseException, traceback: TracebackType):
+def log_unhandled_exception(type_: type[BaseException], value: BaseException, traceback: TracebackType) -> None:
     """Log unhandled exceptions"""
     if issubclass(type_, KeyboardInterrupt):
         sys.__excepthook__(type_, value, traceback)
@@ -92,8 +90,11 @@ def log_unhandled_exception(type_: Type[BaseException], value: BaseException, tr
     logging.critical("Uncaught exception", exc_info=(type_, value, traceback))
 
 
-def setup_logging(config: Optional[LoggingConfig] = LoggingConfig()) -> None:
-    """Setup Python logger"""
+def setup_logging(config: Optional[LoggingConfig] = None) -> None:
+    """Setups Python logger"""
+    if config is None:
+        config = LoggingConfig()
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(
         ColorFormatter(f"%(asctime)s [{Color.green}%(filename)s:%(lineno)d{Color.reset}] %(message)s"),

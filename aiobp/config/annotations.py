@@ -51,19 +51,20 @@ class Loader:
 
 Finally what we need to use in our microservice:
 
-config = Config(Loader('some.file'))
+config = Config(Loader("some.file"))
 """
 
-from collections import namedtuple
-from typing import Annotated, Optional, Type, Union, get_type_hints
+import contextlib
+from typing import Annotated, Any, NamedTuple, Optional, Union, get_args, get_type_hints
 
 from .exceptions import InvalidConfigFile, InvalidConfigImplementation
 
 
-ConfigOption = namedtuple('Option', ['type', 'value'])
+class ConfigOption(NamedTuple):
+    type: Any
+    value: Any
 
-
-ConfigMap = dict[str, Union['ConfigMap', ConfigOption]]
+ConfigMap = dict[str, Union["ConfigMap", ConfigOption]]
 
 
 CONFIG_TYPES = (
@@ -75,16 +76,21 @@ CONFIG_TYPES = (
     Optional[float],
     Optional[int],
     Optional[str],
+    list[bool],
+    list[float],
+    list[int],
+    list[str],
 )
 
 
-def get_options(config_class: Type[Annotated]) -> ConfigMap:
+def get_options(config_class: type[Annotated]) -> ConfigMap:
     """Extract configuration map recursively"""
     config: ConfigMap = {}
 
     options = get_type_hints(config_class)
     if not options:
-        raise InvalidConfigImplementation(f'Configuration class "{config_class}" has no configuration options')
+        error = f'Configuration class "{config_class}" has no configuration options'
+        raise InvalidConfigImplementation(error)
 
     for option_name, option_type in options.items():
         if option_type not in CONFIG_TYPES:
@@ -100,7 +106,24 @@ def get_options(config_class: Type[Annotated]) -> ConfigMap:
     return config
 
 
-def set_options(config: Annotated, values: ConfigMap, path: Optional[list[str]] = None) -> Annotated:
+def parse_list(value_type: type, value: Union[str, list[Any]]) -> list[Any]:
+    """Validate list[Any] configuration option"""
+    if isinstance(value, str):
+        value = [raw.strip() for raw in value.split(",")]
+
+    for option_type in get_args(value_type):
+        with contextlib.suppress(ValueError, TypeError):
+            return [option_type(raw) for raw in value]
+
+    error = f"invalid configuration value for {value_type}: {value}"
+    raise InvalidConfigFile(error)
+
+
+def set_options(
+    config: Annotated,
+    values: ConfigMap,
+    path: Optional[list[str]] = None,
+) -> Annotated:
     """Make instances of configuration classes and set values"""
     for option_name, option_type in get_type_hints(config).items():
         if option_type not in CONFIG_TYPES:
@@ -111,7 +134,8 @@ def set_options(config: Annotated, values: ConfigMap, path: Optional[list[str]] 
             if isinstance(value, ConfigOption):  # option was not set by configuration file loader
                 value = value.value
             if isinstance(value, Exception):
-                raise InvalidConfigFile(f'missing option "{option_name}" in section "{".".join(path)}"') from value
+                error = f'missing option "{option_name}" in section "{".".join(path)}"'
+                raise InvalidConfigFile(error) from value
 
         setattr(config, option_name, value)
 
