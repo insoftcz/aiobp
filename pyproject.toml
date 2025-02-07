@@ -5,6 +5,7 @@ description = "Boilerplate for asyncio service"
 authors = [
     {name = "INSOFT s.r.o.", email = "helpdesk@insoft.cz"}
 ]
+license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
