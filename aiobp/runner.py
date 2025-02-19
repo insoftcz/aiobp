@@ -47,7 +47,7 @@ def log_awaitable(awaitable: Union[asyncio.Task, Coroutine]) -> str:
 
     code = coroutine.cr_code
 
-    cwd = Path.cwd()
+    cwd = Path.cwd().as_posix()
     filename = code.co_filename
     if filename.startswith(cwd):
         filename = filename[len(cwd) + 1 :]
