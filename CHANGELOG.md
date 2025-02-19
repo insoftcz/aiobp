@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.4.1] - 2025-02-19
+
+### 🐛 Bug Fixes
+
+- Get cwd as string for relative filename logging of exceptions
+
+### ⚙️ Miscellaneous Tasks
+
+- Removed LICENSE file as workaround for setuptools bug
+
+
 ## [0.4.0] - 2025-02-07
 
 ### 🚀 Features
