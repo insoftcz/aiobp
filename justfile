@@ -11,7 +11,8 @@ release: create-changelog
     git commit -m {{next_version}}
     git tag -a {{next_version}} -m {{next_version}}
 
-publish release:
+publish:
+    rm dist/*
     uv build
     uv publish
 
