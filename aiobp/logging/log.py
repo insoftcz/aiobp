@@ -9,4 +9,5 @@ info = logging.info
 warning = logging.warning
 error = logging.error
 critical = logging.critical
-trace = functools.partial(logging.log, logging.ERROR, exc_info=True)
+exception = logging.exception
+trace = logging.exception
