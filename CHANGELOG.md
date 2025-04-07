@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.5.0] - 2025-04-07
+
+### 🚀 Features
+
+- *(config)* Added support to read whole .conf section as dict
+
+### 🐛 Bug Fixes
+
+- Remove files from dist directory to avoid unnecessary uploads of previous versions
+
+
 ## [0.4.2] - 2025-02-21
 
 ### 🐛 Bug Fixes

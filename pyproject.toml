@@ -1,6 +1,6 @@
 [project]
 name = "aiobp"
-version = "0.4.2"
+version = "0.5.0"
 description = "Boilerplate for asyncio service"
 authors = [
     {name = "INSOFT s.r.o.", email = "helpdesk@insoft.cz"}
