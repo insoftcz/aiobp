@@ -1,7 +1,7 @@
 """INI like configuration loader"""
 
 import configparser
-from typing import Annotated, Optional, get_origin
+from typing import Annotated, Optional, get_args, get_origin
 
 from .annotations import ConfigOption, get_options, parse_list, set_options
 from .exceptions import InvalidConfigImplementation
@@ -17,6 +17,13 @@ def loader(config_class: type[Annotated], filename: Optional[str] = None) -> Ann
     conf = configparser.ConfigParser()
     conf.read(filename)
     for section_name, options in config.items():
+        # whole section is read as dict
+        if isinstance(options, ConfigOption) and get_origin(options.type) is dict:
+            k_type, v_type = get_args(options.type)
+            if conf.has_section(section_name):
+                config[section_name] = {k_type(k): v_type(v) for k, v in conf.items(section_name)}
+            continue
+
         if not isinstance(options, dict):
             error = f'Class "{config_class.__name__}" can\'t have direct option "{section_name}"'
             raise InvalidConfigImplementation(error)

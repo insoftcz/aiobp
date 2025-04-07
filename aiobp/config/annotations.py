@@ -80,6 +80,10 @@ CONFIG_TYPES = (
     list[float],
     list[int],
     list[str],
+    dict[str, bool],
+    dict[str, float],
+    dict[str, int],
+    dict[str, str],
 )
 
 
