@@ -1,49 +1,46 @@
 """INI like configuration loader"""
 
-import configparser
-from typing import Annotated, Optional, get_args, get_origin
+from configparser import ConfigParser
+from dataclasses import Field, dataclass
+from typing import Annotated, Any, Optional, get_origin
 
-from .annotations import ConfigOption, get_options, parse_list, set_options
-from .exceptions import InvalidConfigImplementation
+from mashumaro.codecs.basic import BasicDecoder
 
 
-def loader(config_class: type[Annotated], filename: Optional[str] = None) -> Annotated:
+def parse_value(s: str, t: type) -> Any:  # noqa: ANN401
+    """Handle lists and bools"""
+    if not isinstance(s, str):
+        return s
+
+    if t is list:
+        return [v.strip() for v in s.split(",")] if isinstance(s, str) else s
+
+    if t is bool:
+        return s.lower() in ("1", "true", "yes")
+
+    return s
+
+
+@classmethod
+def ini_parser(cls: Annotated, data: dict[Any, Any]) -> dict[Any, Any]:
+    """Value type conversion based on annotations"""
+    types = {k: get_origin(v) or v for k, v in cls.__annotations__.items()}
+    return {k: parse_value(v, types.get(k)) for k, v in data.items()}
+
+
+def loader(config_class: type[dataclass], filename: Optional[str] = None) -> Annotated:
     """INI like configuration loader"""
-    config = get_options(config_class)
+    for section_class in config_class.__dataclass_fields__.values():
+        if isinstance(section_class, Field) and section_class.default_factory is not dict:
+            section_class.default_factory.__pre_deserialize__ = ini_parser
+
+    config_decoder = BasicDecoder(config_class)
 
     if filename is None:
-        return set_options(config_class(), config)
+        return config_decoder.decode({})
 
-    conf = configparser.ConfigParser()
+    conf = ConfigParser()
     conf.read(filename)
-    for section_name, options in config.items():
-        # whole section is read as dict
-        if isinstance(options, ConfigOption) and get_origin(options.type) is dict:
-            k_type, v_type = get_args(options.type)
-            if conf.has_section(section_name):
-                config[section_name] = {k_type(k): v_type(v) for k, v in conf.items(section_name)}
-            continue
+    config = {section: dict(conf.items(section)) for section in conf.sections()}
 
-        if not isinstance(options, dict):
-            error = f'Class "{config_class.__name__}" can\'t have direct option "{section_name}"'
-            raise InvalidConfigImplementation(error)
-
-        for option_name, option in options.items():
-            if not isinstance(option, ConfigOption):
-                error = f'"{section_name}" can have only scalar attributes, not subsection "{option_name}"'
-                raise InvalidConfigImplementation(error)
-
-            if option.type is int:
-                get = conf.getint
-            elif option.type is float:
-                get = conf.getfloat
-            elif option.type is bool:
-                get = conf.getboolean
-            else:
-                get = conf.get
-
-            value = get(section_name, option_name, fallback=option.value)
-
-            options[option_name] = parse_list(option.type, value) if get_origin(option.type) is list else value
-
-    return set_options(config_class(), config)
+    return config_decoder.decode(config)

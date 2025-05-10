@@ -20,3 +20,5 @@ push:
     git push
     git push --tags
 
+test:
+    uv run -m unittest discover -s tests
