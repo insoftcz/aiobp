@@ -5,12 +5,15 @@ description = "Boilerplate for asyncio service"
 authors = [
     {name = "INSOFT s.r.o.", email = "helpdesk@insoft.cz"}
 ]
-license = { text = "MIT" }
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "mashumaro>=3.15",
+    "aiohttp>=3.12.2",
+    "msgspec>=0.19.0",
+    "mypy>=1.15.0",
     "pyyaml>=6.0.2",
+    "ruff>=0.11.11",
 ]
 
 [tool.ruff]
@@ -29,7 +32,4 @@ mypy-init-return = true
 [tool.uv]
 package = true
 dev-dependencies = [
-    "pylint>=3.0.3",
-    "ruff>=0.7.1",
-    "mypy>=1.8.0",
 ]

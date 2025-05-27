@@ -1,11 +1,25 @@
-Boilerplate for asyncio service
-===============================
+Asyncio Service Boilerplate
+===========================
 
-This module provides boilerplate for microservices written in asyncio:
+This module provides a foundation for building microservices using Python’s `asyncio` library. Key features include:
 
-  * Runner with task reference handler and graceful shutdown
-  * Configuration provider
-  * Logger with color support
+  * A runner with graceful shutdown
+  * A task reference management
+  * A flexible configuration provider
+  * A logger with colorized output
+
+No dependencies are enforced by default, so you only install what you need.
+For basic usage, no additional Python modules are required.
+The table below summarizes which optional dependencies to install based on the features you want to use:
+
+|     aiobp Feature       | Required Module(s) |
+|-------------------------|--------------------|
+| config (.conf or .json) | msgspec            |
+| config (.yaml)          | msgspec, pyyaml    |
+
+
+Basic example
+-------------
 
 ```python
 import asyncio
@@ -27,7 +41,7 @@ More complex example
 
 ```python
 import asyncio
-import aiohttp  # just for example
+import aiohttp
 import sys
 
 from aiobp import create_task, on_shutdown, runner
