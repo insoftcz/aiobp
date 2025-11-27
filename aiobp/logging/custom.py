@@ -3,10 +3,12 @@
 import logging
 import logging.handlers
 import sys
+from dataclasses import dataclass
 from types import TracebackType
 from typing import ClassVar, Optional
 
 
+@dataclass
 class LoggingConfig:
     """Loging configuration"""
 

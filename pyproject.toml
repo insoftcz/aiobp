@@ -9,11 +9,6 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "aiohttp>=3.12.2",
-    "msgspec>=0.19.0",
-    "mypy>=1.15.0",
-    "pyyaml>=6.0.2",
-    "ruff>=0.11.11",
 ]
 
 [tool.ruff]
@@ -32,4 +27,9 @@ mypy-init-return = true
 [tool.uv]
 package = true
 dev-dependencies = [
+    "aiohttp>=3.12.2",
+    "msgspec>=0.19.0",
+    "mypy>=1.15.0",
+    "pyyaml>=6.0.2",
+    "ruff>=0.11.11",
 ]
