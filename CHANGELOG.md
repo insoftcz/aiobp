@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.0.1] - 2025-11-27
+
+### 🐛 Bug Fixes
+
+- *(logging)* Use dataclass for logging config
+
+
 ## [1.0.0] - 2025-11-27
 
 ### ⚙️ Miscellaneous Tasks
