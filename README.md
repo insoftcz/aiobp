@@ -55,15 +55,13 @@ Add OTEL settings to your `LoggingConfig`:
 level = DEBUG
 filename = service.log
 otel_endpoint = http://localhost:4317
-otel_service_name = my-service
-otel_logs_interval = 5
+otel_export_interval = 5
 ```
 
-| Option              | Default | Description                                      |
-|---------------------|---------|--------------------------------------------------|
-| otel_endpoint       | None    | OTLP gRPC endpoint (e.g. http://localhost:4317)  |
-| otel_service_name   | None    | Service name shown in collector UI               |
-| otel_logs_interval  | 5       | Export interval in seconds (0 = instant export)  |
+| Option               | Default | Description                                      |
+|----------------------|---------|--------------------------------------------------|
+| otel_endpoint        | None    | OTLP gRPC endpoint (e.g. http://localhost:4317)  |
+| otel_export_interval | 5       | Export interval in seconds (0 = instant export)  |
 
 ### Usage
 
@@ -77,7 +75,7 @@ class Config:
 
 # ... load config ...
 
-setup_logging(config.log)
+setup_logging("my-service-name", config.log)
 log.info("This message goes to console, file, and OTEL collector")
 ```
 
@@ -89,7 +87,7 @@ To add custom resource attributes (like location, environment, etc.), set the st
 import os
 
 os.environ["OTEL_RESOURCE_ATTRIBUTES"] = "location=datacenter1,environment=production"
-setup_logging(config.log)
+setup_logging("my-service-name", config.log)
 ```
 
 ### Graceful Fallback
@@ -165,7 +163,7 @@ def main():
         sys.exit(1)
 
     setup_logging(config.log)
-    log.info("Using config file: %s", config_filename)
+    log.info("my-service-name", "Using config file: %s", config_filename)
 
     runner(service(config))
 

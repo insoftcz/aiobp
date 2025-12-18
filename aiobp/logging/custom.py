@@ -15,8 +15,7 @@ class LoggingConfig:
     level: str = "DEBUG"
     filename: Optional[str] = None
     otel_endpoint: Optional[str] = None  # e.g. "http://localhost:4317"
-    otel_service_name: Optional[str] = None
-    otel_logs_interval: int = 5  # seconds, 0 = instant
+    otel_export_interval: int = 5  # seconds, 0 = instant
 
 
 class Color:
@@ -100,12 +99,12 @@ def _setup_otel_logging(
     level: str,
     interval: int = 5,
 ) -> Optional[logging.Handler]:
-    """Setup OpenTelemetry logging handler"""
+    """Setups OpenTelemetry logging handler"""
     try:
         from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
         from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, SimpleLogRecordProcessor
-        from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     except ImportError:
         logging.warning("OpenTelemetry packages not installed, OTEL logging disabled")
         return None
@@ -126,7 +125,7 @@ def _setup_otel_logging(
     return handler
 
 
-def setup_logging(config: Optional[LoggingConfig] = None) -> None:
+def setup_logging(service_name: str, config: Optional[LoggingConfig] = None) -> None:
     """Setups Python logger"""
     if config is None:
         config = LoggingConfig()
@@ -145,8 +144,7 @@ def setup_logging(config: Optional[LoggingConfig] = None) -> None:
         handlers.append(file_handler)
 
     if config and config.otel_endpoint is not None:
-        service_name = config.otel_service_name or "unknown-service"
-        interval = config.otel_logs_interval if hasattr(config, 'otel_logs_interval') else 5
+        interval = config.otel_export_interval if hasattr(config, "otel_export_interval") else 5
         otel_handler = _setup_otel_logging(config.otel_endpoint, service_name, config.level, interval)
         if otel_handler:
             handlers.append(otel_handler)

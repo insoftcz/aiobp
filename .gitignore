@@ -2,3 +2,4 @@ __pycache__/
 .venv
 .idea
 .ruff_cache
+aiobp.egg-info
