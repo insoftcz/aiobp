@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.1.0] - 2025-12-18
+
+### 🚀 Features
+
+- Added OTEL support
+   - * feat: otel support
+* chore: OTEL cleanup
+
+--------- 
+
+
 ## [1.0.1] - 2025-11-27
 
 ### 🐛 Bug Fixes
