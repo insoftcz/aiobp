@@ -14,6 +14,8 @@ class LoggingConfig:
 
     level: str = "DEBUG"
     filename: Optional[str] = None
+    otel_endpoint: Optional[str] = None  # e.g. "http://localhost:4317"
+    otel_export_interval: int = 5  # seconds, 0 = instant
 
 
 class Color:
@@ -91,8 +93,39 @@ def log_unhandled_exception(type_: type[BaseException], value: BaseException, tr
 
     logging.critical("Uncaught exception", exc_info=(type_, value, traceback))
 
+def _setup_otel_logging(
+    endpoint: str,
+    service_name: str,
+    level: str,
+    interval: int = 5,
+) -> Optional[logging.Handler]:
+    """Setups OpenTelemetry logging handler"""
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, SimpleLogRecordProcessor
+        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+    except ImportError:
+        logging.warning("OpenTelemetry packages not installed, OTEL logging disabled")
+        return None
 
-def setup_logging(config: Optional[LoggingConfig] = None) -> None:
+    resource = Resource.create({SERVICE_NAME: service_name})
+    logger_provider = LoggerProvider(resource=resource)
+
+    exporter = OTLPLogExporter(endpoint=endpoint, insecure=True)
+
+    if interval <= 0:
+        processor = SimpleLogRecordProcessor(exporter)
+    else:
+        processor = BatchLogRecordProcessor(exporter, schedule_delay_millis=interval * 1000)
+
+    logger_provider.add_log_record_processor(processor)
+
+    handler = LoggingHandler(level=logging.getLevelName(level), logger_provider=logger_provider)
+    return handler
+
+
+def setup_logging(service_name: str, config: Optional[LoggingConfig] = None) -> None:
     """Setups Python logger"""
     if config is None:
         config = LoggingConfig()
@@ -109,6 +142,12 @@ def setup_logging(config: Optional[LoggingConfig] = None) -> None:
             PrefixExceptionFormatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"),
         )
         handlers.append(file_handler)
+
+    if config and config.otel_endpoint is not None:
+        interval = config.otel_export_interval if hasattr(config, "otel_export_interval") else 5
+        otel_handler = _setup_otel_logging(config.otel_endpoint, service_name, config.level, interval)
+        if otel_handler:
+            handlers.append(otel_handler)
 
     logging.basicConfig(level=config.level if config else None, handlers=handlers)
 

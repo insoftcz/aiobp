@@ -1,7 +1,7 @@
 Asyncio Service Boilerplate
 ===========================
 
-This module provides a foundation for building microservices using Python’s `asyncio` library. Key features include:
+This module provides a foundation for building microservices using Python's `asyncio` library. Key features include:
 
   * A runner with graceful shutdown
   * A task reference management
@@ -16,7 +16,13 @@ The table below summarizes which optional dependencies to install based on the f
 |-------------------------|--------------------|
 | config (.conf or .json) | msgspec            |
 | config (.yaml)          | msgspec, pyyaml    |
+| OpenTelemetry logging   | opentelemetry-sdk, opentelemetry-exporter-otlp-proto-grpc     |
 
+To install with OpenTelemetry support:
+
+```bash
+pip install aiobp[otel]
+```
 
 Basic example
 -------------
@@ -35,6 +41,59 @@ async def main():
 runner(main())
 ```
 
+OpenTelemetry Logging
+---------------------
+
+aiobp supports exporting logs to OpenTelemetry collectors (SigNoz, Jaeger, etc.).
+
+### Configuration
+
+Add OTEL settings to your `LoggingConfig`:
+
+```ini
+[log]
+level = DEBUG
+filename = service.log
+otel_endpoint = http://localhost:4317
+otel_export_interval = 5
+```
+
+| Option               | Default | Description                                      |
+|----------------------|---------|--------------------------------------------------|
+| otel_endpoint        | None    | OTLP gRPC endpoint (e.g. http://localhost:4317)  |
+| otel_export_interval | 5       | Export interval in seconds (0 = instant export)  |
+
+### Usage
+
+```python
+from dataclasses import dataclass
+from aiobp.logging import LoggingConfig, setup_logging, log
+
+@dataclass
+class Config:
+    log: LoggingConfig = None
+
+# ... load config ...
+
+setup_logging("my-service-name", config.log)
+log.info("This message goes to console, file, and OTEL collector")
+```
+
+### Resource Attributes
+
+To add custom resource attributes (like location, environment, etc.), set the standard OTEL environment variable before calling `setup_logging`:
+
+```python
+import os
+
+os.environ["OTEL_RESOURCE_ATTRIBUTES"] = "location=datacenter1,environment=production"
+setup_logging("my-service-name", config.log)
+```
+
+### Graceful Fallback
+
+If `otel_endpoint` is configured but OpenTelemetry packages are not installed, a warning is logged and the application continues with console/file logging only.
+
 
 More complex example
 --------------------
@@ -43,6 +102,7 @@ More complex example
 import asyncio
 import aiohttp
 import sys
+from dataclasses import dataclass
 
 from aiobp import create_task, on_shutdown, runner
 from aiobp.config import InvalidConfigFile, sys_argv_or_filenames
@@ -50,17 +110,19 @@ from aiobp.config.conf import loader
 from aiobp.logging import LoggingConfig, add_devel_log_level, log, setup_logging
 
 
+@dataclass
 class WorkerConfig:
     """Your microservice worker configuration"""
 
     sleep: int = 5
 
 
+@dataclass
 class Config:
     """Put configurations together"""
 
-    worker: WorkerConfig
-    log: LoggingConfig
+    worker: WorkerConfig = None
+    log: LoggingConfig = None
 
 
 async def worker(config: WorkerConfig, client_session: aiohttp.ClientSession) -> int:
@@ -101,7 +163,7 @@ def main():
         sys.exit(1)
 
     setup_logging(config.log)
-    log.info("Using config file: %s", config_filename)
+    log.info("my-service-name", "Using config file: %s", config_filename)
 
     runner(service(config))
 
