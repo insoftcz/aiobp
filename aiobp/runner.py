@@ -109,23 +109,29 @@ async def __graceful_shutdown(timeout: float = 5.0) -> None:
     """Gracefully shutdown coroutines and tasks"""
     log.info(f"Graceful shutdown up to {timeout:.3f} s...")
     remains = timeout
-    remains = await __shutdown_coroutines(timeout=remains, after_tasks_cancel=False)
+    remains = await shutdown_coroutines(timeout=remains, after_tasks_cancel=False)
     remains = await __shutdown_tasks(timeout=remains)
-    remains = await __shutdown_coroutines(timeout=remains, after_tasks_cancel=True)
+    remains = await shutdown_coroutines(timeout=remains, after_tasks_cancel=True)
     if remains > 0:
         log.info("Shutdown completed in %.3f s", (timeout - remains))
     else:
         log.warning("Shutdown not completed within timeout!")
 
 
-async def __shutdown_coroutines(timeout: float, *, after_tasks_cancel: bool) -> float:
-    """Await for on_shutdown callbacks finish with timeout"""
+async def shutdown_coroutines(timeout: float, *, after_tasks_cancel: bool) -> float:
+    """Wait for all registered on_shutdown callbacks to complete, with a timeout.
+
+    This is normally triggered automatically when SIGTERM or Ctrl+C is received.
+    It may also be called explicitly when the main loop is designed to restart
+    on failure and already started services need to be stopped gracefully.
+    """
     log.debug(f"Shutting down coroutines {'after' if after_tasks_cancel else 'before'} tasks cancel...")
 
     for coro, args, when in __on_shutdown[::-1]:
         if when != after_tasks_cancel:
             continue
 
+        __on_shutdown.remove((coro, args, when))
         start = time.time()
         log_args = ",".join(repr(arg) for arg in args)
         try:
@@ -196,32 +202,6 @@ async def __shutdown_tasks(timeout: float) -> float:
 
     took = time.time() - start
     return timeout - took
-
-
-def __prepare_coroutines(*, after_tasks_cancel: bool) -> set[asyncio.Task]:
-    """Prepare coroutines for shutdown"""
-    tasks = set()
-    for coro, args, when in __on_shutdown[::-1]:
-        if when != after_tasks_cancel:
-            continue
-
-        try:
-            coroutine = coro(*args)
-        except Exception:  # noqa: BLE001 - yes, we want to catch it and log it
-            log_args = ",".join(repr(arg) for arg in args)
-            log.trace("Exception in %s(%s)", coro.__name__, log_args)
-            continue
-
-        if not asyncio.iscoroutine(coroutine):  # we may get just plain synchronous method
-            continue
-
-        try:
-            tasks.add(create_task(coroutine, name="OnShutdown"))
-        except Exception as error:  # noqa: BLE001 - yes, we want to catch it and log it
-            log_args = ",".join(repr(arg) for arg in args)
-            log.error("Unable to prepare for graceful shutdown %s(%s): %r", coro, log_args, error)
-
-    return tasks
 
 
 def __task_failed(task: asyncio.Task, canceled_msg: str) -> bool:
