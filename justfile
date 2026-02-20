@@ -12,9 +12,12 @@ release: create-changelog
     git tag -a {{next_version}} -m {{next_version}}
 
 publish:
-    rm dist/*
+    #!/bin/bash
+    rm -rf dist
     uv build
-    uv publish
+    read -rsp "PyPI token: " token
+    echo
+    UV_PUBLISH_TOKEN="$token" uv publish
 
 push:
     git push
