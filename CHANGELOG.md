@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.2.0] - 2026-02-20
+
+### 🚀 Features
+
+- Expose shutdown_coroutines for autorestart services
+
+
 ## [1.1.0] - 2025-12-18
 
 ### 🚀 Features
