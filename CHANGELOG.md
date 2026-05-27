@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.3.0] - 2026-05-27
+
+### 🚀 Features
+
+- Add aiobp.tracing module for OpenTelemetry distributed tracing
+
+### ⚙️ Miscellaneous Tasks
+
+- Skip question for __token__ username in PYPI publish
+
+
 ## [1.2.0] - 2026-02-20
 
 ### 🚀 Features
