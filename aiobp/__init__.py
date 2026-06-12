@@ -1,4 +1,4 @@
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 from .logging import log
 from .runner import runner, on_shutdown

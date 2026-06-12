@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.3.1] - 2026-06-12
+
+### 🐛 Bug Fixes
+
+- *(otel)* Disable telemetry when the OTLP endpoint is unreachable
+
+
 ## [1.3.0] - 2026-05-27
 
 ### 🚀 Features
