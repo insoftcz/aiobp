@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import ClassVar, Optional
 
+from aiobp._otel import endpoint_reachable
+
+_log = logging.getLogger(__name__)
+
 
 @dataclass
 class LoggingConfig:
@@ -106,7 +110,11 @@ def _setup_otel_logging(
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, SimpleLogRecordProcessor
         from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     except ImportError:
-        logging.warning("OpenTelemetry packages not installed, OTEL logging disabled")
+        _log.warning("OpenTelemetry packages not installed, OTEL logging disabled")
+        return None
+
+    if not endpoint_reachable(endpoint):
+        _log.error("OTEL endpoint %s unreachable, OTEL logging disabled", endpoint)
         return None
 
     resource = Resource.create({SERVICE_NAME: service_name})

@@ -7,6 +7,8 @@ import traceback
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional, Tuple, Type
 
+from ._otel import endpoint_reachable
+
 log = logging.getLogger(__name__)
 
 try:
@@ -42,6 +44,9 @@ def setup_tracing(service_name: str, service_version: str, endpoint: Optional[st
         return
     if not _OTEL:
         log.warning("OpenTelemetry packages not installed, tracing disabled")
+        return
+    if not endpoint_reachable(endpoint):
+        log.error("OTEL endpoint %s unreachable, tracing disabled", endpoint)
         return
 
     resource = Resource.create({
