@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.3.2] - 2026-07-14
+
+### 🐛 Bug Fixes
+
+- *(otel)* Survive broken opentelemetry installs by catching all import-time errors, disable tracing/logging with a warning
+
+
 ## [1.3.1] - 2026-06-12
 
 ### 🐛 Bug Fixes
