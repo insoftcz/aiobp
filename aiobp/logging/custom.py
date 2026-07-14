@@ -109,8 +109,8 @@ def _setup_otel_logging(
         from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, SimpleLogRecordProcessor
         from opentelemetry.sdk.resources import SERVICE_NAME, Resource
-    except ImportError:
-        _log.warning("OpenTelemetry packages not installed, OTEL logging disabled")
+    except Exception as e:  # broken installs raise more than ImportError (e.g. StopIteration from entry-point lookup)
+        _log.warning("OpenTelemetry unavailable (%s: %s), OTEL logging disabled", type(e).__name__, e)
         return None
 
     if not endpoint_reachable(endpoint):

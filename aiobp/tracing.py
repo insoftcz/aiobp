@@ -20,8 +20,9 @@ try:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.trace import Status, StatusCode
     _OTEL = True
-except ImportError:
+except Exception as _e:  # broken installs raise more than ImportError (e.g. StopIteration from entry-point lookup)
     _OTEL = False
+    _OTEL_IMPORT_ERROR = _e
 
 _tracer = None  # opentelemetry.trace.Tracer when set
 
@@ -43,7 +44,8 @@ def setup_tracing(service_name: str, service_version: str, endpoint: Optional[st
         log.info("OTEL tracing disabled (no endpoint configured)")
         return
     if not _OTEL:
-        log.warning("OpenTelemetry packages not installed, tracing disabled")
+        log.warning("OpenTelemetry unavailable (%s: %s), tracing disabled",
+                    type(_OTEL_IMPORT_ERROR).__name__, _OTEL_IMPORT_ERROR)
         return
     if not endpoint_reachable(endpoint):
         log.error("OTEL endpoint %s unreachable, tracing disabled", endpoint)
