@@ -19,6 +19,7 @@ The table below summarizes which optional dependencies to install based on the f
 | config (.yaml)          | msgspec, pyyaml    | `logging_yaml`  |
 | OpenTelemetry logging   | opentelemetry-sdk, opentelemetry-exporter-otlp-proto-grpc | `logging_otel`  |
 | OpenTelemetry tracing   | opentelemetry-sdk, opentelemetry-exporter-otlp-proto-grpc | `tracing_otel`  |
+| HTTP server + Swagger   | aiohttp, msgspec                                          | `aiohttp`       |
 
 Logs and traces share the same dependency set — install `aiobp[otel]` to get both:
 
@@ -172,79 +173,283 @@ If tracing isn't configured, `start_span` returns a no-op span; calling `.end()`
 If `setup_tracing` is never called, or the OpenTelemetry packages aren't installed, `traced()` becomes a no-op. Application code using `traced()` and `current_span()` works unchanged whether tracing is on or off.
 
 
-More complex example
---------------------
+## HTTP Server (aiohttp helper)
+
+`aiobp.aiohttp` provides a thin layer on top of aiohttp that gives you:
+
+- **Automatic argument injection** from path params, query params, or custom factories
+- **Documented parameters** via `Annotated[type, Meta(description=...)]` — enforced at registration time
+- **Auto-generated Swagger UI** at `/docs` and OpenAPI JSON at `/openapi.json`
+- **Two sub-routers** — `router.rest` (in Swagger) and `router.html` (not in Swagger, returns `str` as `text/html`)
+- **Dependency injection** for any type via `add_type_injector`
+
+Install the optional extra:
+
+```bash
+pip install aiobp[aiohttp]
+```
+
+### Quick start
+
+```python
+from typing import Annotated
+from msgspec import Meta
+from aiobp import runner
+from aiobp.aiohttp import WebServer
+from aiobp.aiohttp.web import Router
+
+router = Router(title="My API", version="1.0.0")
+
+@router.rest.get("/hello/{who}", tag="Greetings")
+async def hello(who: Annotated[str, Meta(description="Name to greet")]) -> Annotated[str, Meta(description="Greeting")]:
+    """Say hello by name"""
+    return f"Hello, {who}"
+
+async def main():
+    server = WebServer(8888, router=router)
+    await server.start()
+
+runner(main())
+```
+
+Open `http://localhost:8888/docs` for the interactive Swagger UI.
+
+### Argument resolution
+
+Parameters are resolved automatically in this order: **path** → **query string**.
+Every user-facing parameter must be annotated with `Annotated[type, Meta(description=...)]` — this enforces documentation and provides metadata for the OpenAPI spec.
+
+```python
+@router.rest.get("/greet")
+async def greet(
+    who: Annotated[str, Meta(description="Name to greet")],
+    age: Optional[Annotated[int, Meta(description="Age")]] = None,  # optional query param
+) -> Annotated[str, Meta(description="Greeting")]:
+    return f"Hello {who}, age {age}" if age else f"Hello {who}"
+```
+
+### REST vs HTML sub-routers
+
+| Sub-router | Appears in Swagger | Return type | Default content-type |
+|---|---|---|---|
+| `router.rest` | yes | `str` / `bytes` / `web.StreamResponse` | `application/json` |
+| `router.html` | no | `str` / `bytes` / `web.StreamResponse` | `text/html` |
+
+```python
+# REST — documented in Swagger
+@router.rest.get("/api/users", tag="Users")
+async def list_users() -> Annotated[str, Meta(description="User list")]:
+    return "[]"
+
+# HTML — not in Swagger, returns text/html
+@router.html.get("/dashboard")
+async def dashboard() -> str:
+    return "<h1>Dashboard</h1>"
+```
+
+Both sub-routers support a `content_type` parameter on the decorator to override the response content type — useful for serving binary data:
+
+```python
+@router.html.get("/audio/{id}", content_type="audio/mpeg")
+async def stream_audio(id: Annotated[str, Meta(description="Track ID")]) -> bytes:
+    return open(f"{id}.mp3", "rb").read()
+```
+
+### URL prefixes
+
+```python
+Router(api_prefix="/api", html_prefix="")   # REST at /api/..., HTML at /...
+Router(api_prefix=None)                      # no prefix (default)
+```
+
+### Dependency injection
+
+Register a factory for any type with `add_type_injector`. The factory receives the raw `aiohttp.web.Request` and returns an instance. Any handler that declares that type as a parameter gets it injected automatically — no `Annotated`/`Meta` required.
+
+```python
+from dataclasses import dataclass
+from aiohttp import web
+
+@dataclass
+class User:
+    username: str
+    email: str
+
+def user_from_request(request: web.Request) -> User:
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user = token_store.get(token)
+    if user is None:
+        raise web.HTTPUnauthorized(text="Invalid token")
+    return user
+
+router.add_type_injector(User, user_from_request)
+
+# Now any handler can declare `user: User` and it is resolved automatically:
+@router.rest.get("/me", tag="Auth")
+async def me(user: User) -> Annotated[str, Meta(description="Current user")]:
+    return f"{user.username} <{user.email}>"
+```
+
+The built-in `web.Request` injector is always registered — declare `request: web.Request` in any handler to receive the raw request.
+
+### Authentication & Swagger
+
+Call `router.openapi.add_bearer_auth()` to add a Bearer token scheme to the Swagger UI. Mark individual endpoints with `secure=False` to make them publicly accessible:
+
+```python
+router.openapi.add_bearer_auth()  # all endpoints require auth by default
+
+@router.rest.post("/auth/token", tag="Auth", secure=False)  # public
+async def obtain_token(
+    username: Annotated[str, Meta(description="Username")],
+    password: Annotated[str, Meta(description="Password")],
+) -> Annotated[str, Meta(description="Bearer token")]:
+    ...
+
+@router.rest.get("/me", tag="Auth")  # protected (inherits global auth)
+async def me(user: User) -> Annotated[str, Meta(description="User info")]:
+    ...
+```
+
+For OAuth2 with a token endpoint:
+
+```python
+router.openapi.add_oauth2("/auth/token", scopes={"read": "Read access", "write": "Write access"})
+```
+
+### WebServer options
+
+```python
+WebServer(
+    port=8888,
+    host="127.0.0.1",  # default
+    router=router,     # your Router instance
+    docs=True,         # serve /docs and /openapi.json (default)
+)
+```
+
+Access the underlying `aiohttp.web.Application` for middleware or extra routes:
+
+```python
+server = WebServer(8888, router=router)
+server.app.middlewares.append(my_middleware)
+await server.start()
+```
+
+## More complex example
+
+A complete service with a REST API, HTML pages, Bearer token authentication,
+and dependency injection:
 
 ```python
 import asyncio
-import aiohttp
-import sys
+import secrets
 from dataclasses import dataclass
+from typing import Annotated, Optional
 
-from aiobp import create_task, on_shutdown, runner
-from aiobp.config import InvalidConfigFile, sys_argv_or_filenames
-from aiobp.config.conf import loader
-from aiobp.logging import LoggingConfig, add_devel_log_level, log, setup_logging
+from aiohttp import web
+from msgspec import Meta
 
+from aiobp import runner
+from aiobp.aiohttp import WebServer
+from aiobp.aiohttp.web import Router
+
+router = Router(title="My Service", version="1.0.0")
+router.openapi.add_bearer_auth()  # protect all REST endpoints by default
+
+
+# --- Auth model & token store ---
 
 @dataclass
-class WorkerConfig:
-    """Your microservice worker configuration"""
+class User:
+    username: str
+    email: str
 
-    sleep: int = 5
-
-
-@dataclass
-class Config:
-    """Put configurations together"""
-
-    worker: WorkerConfig = None
-    log: LoggingConfig = None
+_CREDENTIALS = {"kenny": "password123"}
+_USERS = {"kenny": User("kenny", "kenny@example.com")}
+_TOKENS: dict[str, User] = {}
 
 
-async def worker(config: WorkerConfig, client_session: aiohttp.ClientSession) -> int:
-    """Perform service work"""
-    attempts = 0
-    try:
-        async with client_session.get('http://python.org') as resp:
-            assert resp.status == 200
-            log.debug('Page length %d', len(await resp.text()))
-            attempts += 1
-        await asyncio.sleep(config.sleep)
-    except asyncio.CancelledError:
-        log.info('Doing some shutdown work')
-        await client_session.post('http://localhost/service/attempts', data={'attempts': attempts})
+def _user_from_request(request: web.Request) -> User:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise web.HTTPUnauthorized(text="Missing Authorization header")
+    user = _TOKENS.get(auth.removeprefix("Bearer ").strip())
+    if user is None:
+        raise web.HTTPUnauthorized(text="Invalid or expired token")
+    return user
 
-    return attempts
+router.add_type_injector(User, _user_from_request)
 
 
-async def service(config: Config):
-    """Your microservice"""
-    client_session = aiohttp.ClientSession()
-    on_shutdown(client_session.close, after_tasks_cancel=True)
+# --- REST endpoints (appear in Swagger) ---
 
-    create_task(worker(config.worker, client_session), 'PythonFetcher')
-
-    # you can do some monitoring, statistics collection, etc.
-    # or just let the method finish and the runner will wait for Ctrl+C or kill
-
-
-def main():
-    """Example microservice"""
-    add_devel_log_level()
-    try:
-        config_filename = sys_argv_or_filenames('service.local.conf', 'service.conf')
-        config = loader(Config, config_filename)
-    except InvalidConfigFile as error:
-        print(f'Invalid configuration: {error}')
-        sys.exit(1)
-
-    setup_logging(config.log)
-    log.info("my-service-name", "Using config file: %s", config_filename)
-
-    runner(service(config))
+@router.rest.post("/auth/token", tag="Auth", secure=False)
+async def obtain_token(
+    username: Annotated[str, Meta(description="Username")],
+    password: Annotated[str, Meta(description="Password")],
+) -> Annotated[str, Meta(description="Bearer token")]:
+    """Obtain a bearer token"""
+    expected = _CREDENTIALS.get(username)
+    if expected is None or not secrets.compare_digest(expected, password):
+        raise web.HTTPUnauthorized(text="Invalid credentials")
+    token = secrets.token_urlsafe(32)
+    _TOKENS[token] = _USERS[username]
+    return token
 
 
-if __name__ == '__main__':
-    main()
+@router.rest.get("/me", tag="Auth")
+async def me(user: User) -> Annotated[str, Meta(description="Current user")]:
+    """Return the authenticated user's info"""
+    return f"{user.username} <{user.email}>"
+
+
+@router.rest.get("/greet", tag="Greet")
+async def greet(
+    who: Annotated[str, Meta(description="Name to greet")],
+    age: Optional[Annotated[int, Meta(description="Age")]] = None,
+) -> Annotated[str, Meta(description="Greeting")]:
+    """Greet with optional age"""
+    return f"Hello {who}, age {age}" if age else f"Hello {who}"
+
+
+# --- HTML endpoints (not in Swagger, return str → text/html) ---
+
+@router.html.get("/")
+async def index() -> str:
+    return "<h1>My Service</h1><a href='/docs'>API docs</a>"
+
+
+@router.html.get("/health")
+async def health(request: web.Request) -> str:
+    return f"ok@{request.host}"
+
+
+@router.html.get("/profile/{name}")
+async def profile(name: Annotated[str, Meta(description="Username")]) -> str:
+    return f"<h1>Profile: {name}</h1>"
+
+
+# --- Start ---
+
+async def main() -> None:
+    server = WebServer(8888, router=router)
+    await server.start()
+    await asyncio.Event().wait()  # run until Ctrl+C
+
+
+if __name__ == "__main__":
+    runner(main())
+```
+
+Get a token and call a protected endpoint:
+
+```bash
+# Obtain token
+curl -X POST "http://localhost:8888/auth/token?username=kenny&password=password123"
+# → eyJ...
+
+# Call protected endpoint
+curl -H "Authorization: Bearer eyJ..." http://localhost:8888/me
+# → kenny <kenny@example.com>
 ```

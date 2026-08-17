@@ -26,9 +26,8 @@ tracing_otel = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
 ]
-otel = [
-    "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
+aiohttp = [
+    "aiohttp>=3.13.3",
 ]
 
 [dependency-groups]
@@ -42,13 +41,30 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["D107", "D400", "D415", "FA100", "D101", "D102"]
+ignore = ["D107", "D400", "D415", "FA100", "D101", "D102", "PERF203"]
 
 [tool.ruff.lint.flake8-annotations]
 mypy-init-return = true
 
 [tool.ruff.per-file-ignores]
 "tests/*.py" = ["S101"]
+# provider.py and web.py use Python reflection APIs (inspect, get_origin, get_args)
+# and must override aiohttp base classes that use **kwargs: Any — ANN401 is unavoidable.
+"aiobp/aiohttp/provider.py" = ["ANN401"]
+"aiobp/aiohttp/web.py" = ["ANN401"]
 
 [tool.uv]
 package = true
+
+[tool.basedpyright]
+pythonVersion = "3.9"
+pythonPlatform = "Linux"
+# Reflection APIs (inspect, get_origin, get_args) and aiohttp base classes
+# inherently use Any. Disable Any-strictness project-wide; real type errors
+# are still caught by reportMissingTypeArgument and explicit annotations.
+reportAny = false
+reportExplicitAny = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportUnknownMemberType = false

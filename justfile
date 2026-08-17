@@ -24,4 +24,5 @@ push:
     git push --tags
 
 test:
+    uv sync --all-extras
     uv run -m unittest discover -s tests
