@@ -5,6 +5,8 @@ import re
 from collections.abc import Callable
 from typing import Any, Optional
 
+from ._provider import Provider
+
 # Mapping from Python built-in types to OpenAPI schema types.
 _TYPE_MAP: dict[type, dict[str, str]] = {
     str: {"type": "string"},
@@ -27,9 +29,9 @@ def _path_param_names(path: str) -> set[str]:
 class OpenAPIBuilder:
     """Accumulates route metadata and produces an OpenAPI 3.0 document."""
 
-    def __init__(self, title: str = "API", version: str = "1.0.0") -> None:
-        self._title: str = title
-        self._version: str = version
+    def __init__(self) -> None:
+        self.title: str = "API"
+        self.version: str = "0.0.0"
         self._paths: dict[str, Any] = {}
         self._security_schemes: dict[str, Any] = {}
         self._global_security: list[dict[str, list[str]]] = []
@@ -79,7 +81,6 @@ class OpenAPIBuilder:
         secure=False — mark this endpoint as public (overrides global security).
         secure=None  — inherit global security (default).
         """
-        from .provider import Provider
 
         openapi_path = _PATH_PARAM_RE.sub(r"{\1}", path)
         path_param_names = _path_param_names(openapi_path)
@@ -94,7 +95,7 @@ class OpenAPIBuilder:
                 continue
 
             try:
-                arg_type, optional, meta = Provider.get_annotation(annotation)
+                arg_type, optional, meta, _source = Provider.get_annotation(annotation)
             except TypeError:
                 continue
 
@@ -112,7 +113,7 @@ class OpenAPIBuilder:
                 "required": required,
                 "schema": _schema_for(arg_type),
             }
-            if meta.description:
+            if meta is not None and meta.description:
                 entry["description"] = meta.description
             if default is not None:
                 entry["schema"] = {**entry["schema"], "default": default}
@@ -141,7 +142,7 @@ class OpenAPIBuilder:
     def build(self) -> dict[str, Any]:
         spec: dict[str, Any] = {
             "openapi": "3.0.0",
-            "info": {"title": self._title, "version": self._version},
+            "info": {"title": self.title, "version": self.version},
             "paths": self._paths,
         }
         if self._security_schemes:
@@ -150,9 +151,8 @@ class OpenAPIBuilder:
             spec["security"] = self._global_security
         return spec
 
-    @property
-    def swagger_ui_html(self) -> str:
-        return """<!DOCTYPE html>
+    def swagger_ui_html(self, url: str) -> str:
+        return f"""<!DOCTYPE html>
 <html>
 <head>
   <title>Swagger UI</title>
@@ -163,7 +163,11 @@ class OpenAPIBuilder:
   <div id="swagger-ui"></div>
   <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
   <script>
-    SwaggerUIBundle({ url: "/openapi.json", dom_id: "#swagger-ui" });
+    SwaggerUIBundle({{
+      url: "{url}",
+      dom_id: "#swagger-ui",
+      persistAuthorization: true
+    }});
   </script>
 </body>
 </html>"""

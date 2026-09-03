@@ -1,8 +1,32 @@
 """Test config loaders"""
 
+import logging
 import unittest
+from contextlib import contextmanager
 
 from aiobp.logging import suppress_and_log
+
+
+@contextmanager
+def assert_no_logs(level: str = "ERROR"):
+    """Context manager that fails if any log at *level* or above is emitted."""
+    numeric = getattr(logging, level)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: records.append(record)  # type: ignore[assignment]
+    root = logging.getLogger()
+    old_level = root.level
+    root.setLevel(min(old_level, numeric))
+    root.addHandler(handler)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+    errors = [r for r in records if r.levelno >= numeric]
+    if errors:
+        msgs = [handler.format(r) for r in errors]
+        raise AssertionError(f"Unexpected log records at {level}: {msgs}")
 
 
 class TestLogging(unittest.TestCase):
@@ -18,7 +42,7 @@ class TestLogging(unittest.TestCase):
 
     def _assert_muted(self, mute: object) -> None:  # type: ignore[explicit-any]
         """Assert KeyError is suppressed silently and TypeError is suppressed with logging."""
-        with self.assertNoLogs(level="ERROR"):
+        with assert_no_logs(level="ERROR"):
             try:
                 with suppress_and_log(KeyError, TypeError, mute=mute):  # type: ignore[arg-type]
                     raise KeyError

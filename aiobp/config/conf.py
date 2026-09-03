@@ -1,7 +1,7 @@
 """INI like configuration loader"""
 
 from configparser import ConfigParser
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from typing import Annotated, Any, Optional, get_args, get_origin, get_type_hints
 
 import msgspec
@@ -56,7 +56,17 @@ def __retype(val: Any, composite_type: Optional[type]) -> Any:
 def __ini_typer(obj: Annotated, data: dict[Any, Any]) -> dict[Any, Any]:
     """Value type conversion based on annotations"""
     hints = get_type_hints(obj)
-    return {key: __retype(val, hints.get(key)) for key, val in data.items()}
+    result = {key: __retype(val, hints.get(key)) for key, val in data.items()}
+
+    for key, hint_type in hints.items():
+        if key not in result:
+            basic_type = get_origin(hint_type) or hint_type
+            if isinstance(basic_type, type) and (
+                is_dataclass(basic_type) or issubclass(basic_type, msgspec.Struct)
+            ):
+                result[key] = {}
+
+    return result
 
 
 def loader(config_class: type[dataclass], filename: Optional[str] = None) -> Annotated:

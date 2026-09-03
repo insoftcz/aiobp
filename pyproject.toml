@@ -12,10 +12,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-logging = [
+config = [
     "msgspec>=0.19.0",
 ]
-logging_yaml = [
+config_yaml = [
     "pyyaml>=6.0.2",
 ]
 logging_otel = [
@@ -50,8 +50,7 @@ mypy-init-return = true
 "tests/*.py" = ["S101"]
 # provider.py and web.py use Python reflection APIs (inspect, get_origin, get_args)
 # and must override aiohttp base classes that use **kwargs: Any — ANN401 is unavoidable.
-"aiobp/aiohttp/provider.py" = ["ANN401"]
-"aiobp/aiohttp/web.py" = ["ANN401"]
+"aiobp/aiohttp/_provider.py" = ["ANN401"]
 
 [tool.uv]
 package = true

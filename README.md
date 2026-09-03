@@ -180,7 +180,7 @@ If `setup_tracing` is never called, or the OpenTelemetry packages aren't install
 - **Automatic argument injection** from path params, query params, or custom factories
 - **Documented parameters** via `Annotated[type, Meta(description=...)]` — enforced at registration time
 - **Auto-generated Swagger UI** at `/docs` and OpenAPI JSON at `/openapi.json`
-- **Two sub-routers** — `router.rest` (in Swagger) and `router.html` (not in Swagger, returns `str` as `text/html`)
+- **Two routing styles** — `router.api` (documented in Swagger, JSON default) and `router.get()` / `router.post()` etc. (plain undocumented routes, text/html default)
 - **Dependency injection** for any type via `add_type_injector`
 
 Install the optional extra:
@@ -195,12 +195,11 @@ pip install aiobp[aiohttp]
 from typing import Annotated
 from msgspec import Meta
 from aiobp import runner
-from aiobp.aiohttp import WebServer
-from aiobp.aiohttp.web import Router
+from aiobp.aiohttp import Router, WebServer
 
 router = Router(title="My API", version="1.0.0")
 
-@router.rest.get("/hello/{who}", tag="Greetings")
+@router.api.get("/hello/{who}", tag="Greetings")
 async def hello(who: Annotated[str, Meta(description="Name to greet")]) -> Annotated[str, Meta(description="Greeting")]:
     """Say hello by name"""
     return f"Hello, {who}"
@@ -220,7 +219,7 @@ Parameters are resolved automatically in this order: **path** → **query string
 Every user-facing parameter must be annotated with `Annotated[type, Meta(description=...)]` — this enforces documentation and provides metadata for the OpenAPI spec.
 
 ```python
-@router.rest.get("/greet")
+@router.api.get("/greet")
 async def greet(
     who: Annotated[str, Meta(description="Name to greet")],
     age: Optional[Annotated[int, Meta(description="Age")]] = None,  # optional query param
@@ -228,39 +227,137 @@ async def greet(
     return f"Hello {who}, age {age}" if age else f"Hello {who}"
 ```
 
-### REST vs HTML sub-routers
+### Argument source
 
-| Sub-router | Appears in Swagger | Return type | Default content-type |
-|---|---|---|---|
-| `router.rest` | yes | `str` / `bytes` / `web.StreamResponse` | `application/json` |
-| `router.html` | no | `str` / `bytes` / `web.StreamResponse` | `text/html` |
+By default, parameters are resolved by trying the URL path first, then the query string.
+You can restrict or change the source with the `Path`, `Query`, and `Body` markers inside `Annotated`:
 
 ```python
-# REST — documented in Swagger
-@router.rest.get("/api/users", tag="Users")
+from aiobp.aiohttp import Path, Query, Body
+```
+
+| Marker | Resolves from | Typical use |
+|--------|--------------|-------------|
+| `Path` | URL path parameters only | `/users/{user_id}` |
+| `Query` | Query string only | `?page=2&limit=10` |
+| `Body` | Request body | JSON, form data, file upload |
+| *(none)* | Path first, then query *(default)* | Simple handlers |
+
+```python
+@router.api.get("/users/{user_id}")
+async def get_user(
+    user_id: Annotated[int, Meta(description="User ID"), Path],
+    fields: Annotated[str, Meta(description="Comma-separated fields"), Query],
+) -> Annotated[str, Meta(description="User")]:
+    ...
+```
+
+#### `Body` source
+
+`Body` resolves the argument from the request body. The parsing strategy is chosen automatically based on the argument type and the request's `Content-Type`:
+
+| Argument type | Content-Type | Behaviour |
+|---|---|---|
+| `msgspec.Struct` | `application/json` | Decode JSON into the struct |
+| `msgspec.Struct` | `application/x-www-form-urlencoded` or `multipart/form-data` | Convert form fields into the struct |
+| `bytes` | `multipart/form-data` | Extract the file field matching the parameter name |
+| `bytes` | anything else | Read the raw request body |
+| simple type (`str`, `int`, …) | `application/json` | Extract a single field by parameter name from JSON |
+| simple type | form / multipart | Extract a single field by parameter name from form data |
+
+```python
+import msgspec
+
+class CreateItem(msgspec.Struct):
+    name: str
+    price: float
+
+# JSON body → struct
+@router.api.post("/items", tag="Items")
+async def create_item(
+    item: Annotated[CreateItem, Meta(description="Item to create"), Body],
+) -> Annotated[str, Meta(description="Item ID")]:
+    return f"created {item.name}"
+
+# File upload
+@router.api.post("/upload", tag="Files")
+async def upload(
+    file: Annotated[bytes, Meta(description="File to upload"), Body],
+) -> Annotated[str, Meta(description="Size")]:
+    return str(len(file))
+```
+
+> **Note:** Only one `Body` argument per handler is allowed. Declaring two raises `TypeError` at registration time.
+
+### API vs plain routes
+
+| Style | Appears in Swagger | Return type | Default content-type |
+|---|---|---|---|
+| `router.api` | yes | `str` / `bytes` / `web.StreamResponse` | `application/json` |
+| `router.get()` / `router.post()` etc. | no | `str` / `bytes` / `web.StreamResponse` | `text/html` |
+
+```python
+# API — documented in Swagger
+@router.api.get("/api/users", tag="Users")
 async def list_users() -> Annotated[str, Meta(description="User list")]:
     return "[]"
 
-# HTML — not in Swagger, returns text/html
-@router.html.get("/dashboard")
+# Plain route — not in Swagger, returns text/html
+@router.get("/dashboard")
 async def dashboard() -> str:
     return "<h1>Dashboard</h1>"
 ```
 
-Both sub-routers support a `content_type` parameter on the decorator to override the response content type — useful for serving binary data:
+Both styles support a `content_type` parameter on the decorator to override the response content type — useful for serving binary data:
 
 ```python
-@router.html.get("/audio/{id}", content_type="audio/mpeg")
+@router.get("/audio/{id}", content_type="audio/mpeg")
 async def stream_audio(id: Annotated[str, Meta(description="Track ID")]) -> bytes:
     return open(f"{id}.mp3", "rb").read()
 ```
 
-### URL prefixes
+### Class-based routing with `include()`
+
+For larger applications you can group related endpoints in a class using the same `router.api` and `router.get()` / `router.post()` decorators, then mount them with `Router.include()`:
 
 ```python
-Router(api_prefix="/api", html_prefix="")   # REST at /api/..., HTML at /...
-Router(api_prefix=None)                      # no prefix (default)
+router = Router()
+
+class ItemRoutes:
+    @router.api.get("/items/{item_id}", tag="Items")
+    async def get_item(
+        self, item_id: Annotated[int, Meta(description="Item ID"), Path],
+    ) -> Annotated[str, Meta(description="Item")]:
+        return f"Item {item_id}"
+
+    @router.api.post("/items", tag="Items")
+    async def create_item(
+        self, item: Annotated[CreateItem, Meta(description="New item"), Body],
+    ) -> Annotated[str, Meta(description="Item ID")]:
+        return f"created {item.name}"
+
+    @router.get("/items/page")
+    async def item_page(self) -> str:
+        return "<h1>Items</h1>"
+
+router.include(ItemRoutes())
 ```
+
+> **Note:** The `Router` must be created **before** the class definition so the decorators can reference it.
+
+`include()` automatically sets the OpenAPI tag to the class name (e.g. `ItemRoutes`) for all API routes that don't already specify a `tag=...` in the decorator.
+
+This registers:
+
+| Method | Path | Style |
+|--------|------|-------|
+| GET | `/items/{item_id}` | api |
+| POST | `/items` | api |
+| GET | `/items/page` | plain |
+
+Decorator paths are always the full path — there is no prefix manipulation.
+
+Duplicate routes (same HTTP method + path) raise `ValueError` at registration time, whether they come from decorators or `include()`.
 
 ### Dependency injection
 
@@ -285,7 +382,7 @@ def user_from_request(request: web.Request) -> User:
 router.add_type_injector(User, user_from_request)
 
 # Now any handler can declare `user: User` and it is resolved automatically:
-@router.rest.get("/me", tag="Auth")
+@router.api.get("/me", tag="Auth")
 async def me(user: User) -> Annotated[str, Meta(description="Current user")]:
     return f"{user.username} <{user.email}>"
 ```
@@ -299,14 +396,14 @@ Call `router.openapi.add_bearer_auth()` to add a Bearer token scheme to the Swag
 ```python
 router.openapi.add_bearer_auth()  # all endpoints require auth by default
 
-@router.rest.post("/auth/token", tag="Auth", secure=False)  # public
+@router.api.post("/auth/token", tag="Auth", secure=False)  # public
 async def obtain_token(
     username: Annotated[str, Meta(description="Username")],
     password: Annotated[str, Meta(description="Password")],
 ) -> Annotated[str, Meta(description="Bearer token")]:
     ...
 
-@router.rest.get("/me", tag="Auth")  # protected (inherits global auth)
+@router.api.get("/me", tag="Auth")  # protected (inherits global auth)
 async def me(user: User) -> Annotated[str, Meta(description="User info")]:
     ...
 ```
@@ -338,7 +435,7 @@ await server.start()
 
 ## More complex example
 
-A complete service with a REST API, HTML pages, Bearer token authentication,
+A complete service with an API, plain routes, Bearer token authentication,
 and dependency injection:
 
 ```python
@@ -351,8 +448,7 @@ from aiohttp import web
 from msgspec import Meta
 
 from aiobp import runner
-from aiobp.aiohttp import WebServer
-from aiobp.aiohttp.web import Router
+from aiobp.aiohttp import Router, WebServer
 
 router = Router(title="My Service", version="1.0.0")
 router.openapi.add_bearer_auth()  # protect all REST endpoints by default
@@ -382,9 +478,9 @@ def _user_from_request(request: web.Request) -> User:
 router.add_type_injector(User, _user_from_request)
 
 
-# --- REST endpoints (appear in Swagger) ---
+# --- API endpoints (appear in Swagger) ---
 
-@router.rest.post("/auth/token", tag="Auth", secure=False)
+@router.api.post("/auth/token", tag="Auth", secure=False)
 async def obtain_token(
     username: Annotated[str, Meta(description="Username")],
     password: Annotated[str, Meta(description="Password")],
@@ -398,13 +494,13 @@ async def obtain_token(
     return token
 
 
-@router.rest.get("/me", tag="Auth")
+@router.api.get("/me", tag="Auth")
 async def me(user: User) -> Annotated[str, Meta(description="Current user")]:
     """Return the authenticated user's info"""
     return f"{user.username} <{user.email}>"
 
 
-@router.rest.get("/greet", tag="Greet")
+@router.api.get("/greet", tag="Greet")
 async def greet(
     who: Annotated[str, Meta(description="Name to greet")],
     age: Optional[Annotated[int, Meta(description="Age")]] = None,
@@ -413,19 +509,19 @@ async def greet(
     return f"Hello {who}, age {age}" if age else f"Hello {who}"
 
 
-# --- HTML endpoints (not in Swagger, return str → text/html) ---
+# --- Plain routes (not in Swagger, return str → text/html) ---
 
-@router.html.get("/")
+@router.get("/")
 async def index() -> str:
     return "<h1>My Service</h1><a href='/docs'>API docs</a>"
 
 
-@router.html.get("/health")
+@router.get("/health")
 async def health(request: web.Request) -> str:
     return f"ok@{request.host}"
 
 
-@router.html.get("/profile/{name}")
+@router.get("/profile/{name}")
 async def profile(name: Annotated[str, Meta(description="Username")]) -> str:
     return f"<h1>Profile: {name}</h1>"
 
