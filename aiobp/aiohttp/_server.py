@@ -8,7 +8,7 @@ from aiohttp.web_routedef import RouteTableDef
 
 from aiobp import log, on_shutdown
 
-from ._router import router
+from ._router import Router, router
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 Middleware = Callable[[web.Request, Handler], Awaitable[web.StreamResponse]]

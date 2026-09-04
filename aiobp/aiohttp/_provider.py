@@ -2,6 +2,7 @@
 
 import inspect
 from collections.abc import Callable
+from enum import Enum
 from functools import partial
 from typing import TYPE_CHECKING, Annotated, Any, Optional, Union, final, get_args, get_origin, get_type_hints
 
@@ -14,6 +15,23 @@ from typing_extensions import is_typeddict, override
 InjectorFactory = Callable[[web.Request], Any]
 # Getter stored per argument: either an InjectorFactory or a partial __getter call.
 ArgGetter = Callable[..., Any]
+
+
+class SourceKind(str, Enum):
+    """Where a handler argument (or entire body) is resolved from."""
+
+    PATH = "path"
+    QUERY = "query"
+    HEADER = "header"
+    COOKIE = "cookie"
+    BODY = "body"
+    BODY_KEY = "body_key"
+    PATH_ITEMS = "path_items"
+    QUERY_ITEMS = "query_items"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
 
 
 @final
@@ -47,7 +65,7 @@ class Source:
 
     __slots__ = ("kind",)
 
-    def __init__(self, kind: str) -> None:
+    def __init__(self, kind: SourceKind) -> None:
         self.kind = kind
 
     @override
@@ -80,17 +98,17 @@ if TYPE_CHECKING:
     from typing import Annotated as PathKey  # pyright: ignore[reportUnusedImport]
     from typing import Annotated as QueryKey  # pyright: ignore[reportUnusedImport]
 else:
-    PathKey = Source("path")
-    QueryKey = Source("query")
-    HeaderKey = Source("header")
-    CookieKey = Source("cookie")
-    BodyKey = Source("body_key")
-    FromBody = Source("body")
-    FromPath = Source("path_items")
-    FromQuery = Source("query_items")
+    PathKey = Source(SourceKind.PATH)
+    QueryKey = Source(SourceKind.QUERY)
+    HeaderKey = Source(SourceKind.HEADER)
+    CookieKey = Source(SourceKind.COOKIE)
+    BodyKey = Source(SourceKind.BODY_KEY)
+    FromBody = Source(SourceKind.BODY)
+    FromPath = Source(SourceKind.PATH_ITEMS)
+    FromQuery = Source(SourceKind.QUERY_ITEMS)
 
 
-def Param(description: str, *, source: Optional[str] = None, **kwargs: Any) -> Meta:  # noqa: N802
+def Param(description: str, *, source: Optional[str] = None, example: Any = None, **kwargs: Any) -> Meta:  # noqa: N802
     """Build ``msgspec.Meta`` with the description as first positional argument.
 
     Usage::
@@ -101,10 +119,21 @@ def Param(description: str, *, source: Optional[str] = None, **kwargs: Any) -> M
     argument itself, e.g. a header that isn't a valid Python identifier::
 
         content_type: HeaderKey[str, Param("Call unique ID", source="Content-Type")]
+
+    Pass ``example`` for the common single-value case — it's shorthand for
+    ``examples=[value]`` (OpenAPI/JSON Schema only has the plural ``examples``
+    keyword; a single example is just a one-item list)::
+
+        who: PathKey[str, Param("Name to greet", example="Alice")]
     """
     extra = kwargs.pop("extra", None)
     if source is not None:
         extra = {**(extra or {}), "source": source}
+    if example is not None:
+        if "examples" in kwargs:
+            msg = "Param() got both example= and examples= — pass only one"
+            raise TypeError(msg)
+        kwargs["examples"] = [example]
     return Meta(description=description, extra=extra, **kwargs)
 
 
@@ -141,11 +170,11 @@ class Provider:
                     self._args[param.name] = factory
                     continue
 
-                if source is not None and source.kind == "body":
+                if source is not None and source.kind == SourceKind.BODY:
                     self._args[param.name] = partial(
                         self._get_body, param.name, arg_type, optional=optional, default=default,
                     )
-                elif source is not None and source.kind == "body_key":
+                elif source is not None and source.kind == SourceKind.BODY_KEY:
                     self._args[param.name] = partial(
                         self._get_body_key,
                         param.name,
@@ -155,8 +184,10 @@ class Provider:
                         meta=meta,
                         source_name=self._source_name(param.name, meta),
                     )
-                elif source is not None and source.kind in ("path_items", "query_items"):
-                    get_mapping = self._get_path_mapping if source.kind == "path_items" else self._get_query_mapping
+                elif source is not None and source.kind in (SourceKind.PATH_ITEMS, SourceKind.QUERY_ITEMS):
+                    get_mapping = (
+                        self._get_path_mapping if source.kind == SourceKind.PATH_ITEMS else self._get_query_mapping
+                    )
                     self._args[param.name] = partial(
                         self._get_mapping, param.name, get_mapping, arg_type, optional=optional, default=default,
                     )
@@ -185,11 +216,11 @@ class Provider:
         """Pick the getter(s) to try for a non-body argument, in order."""
         if source is None:
             return [self._get_from_path, self._get_from_query]
-        by_kind: dict[str, Callable[[str, web.Request], Optional[str]]] = {
-            "path": self._get_from_path,
-            "query": self._get_from_query,
-            "header": self._get_from_header,
-            "cookie": self._get_from_cookie,
+        by_kind: dict[SourceKind, Callable[[str, web.Request], Optional[str]]] = {
+            SourceKind.PATH: self._get_from_path,
+            SourceKind.QUERY: self._get_from_query,
+            SourceKind.HEADER: self._get_from_header,
+            SourceKind.COOKIE: self._get_from_cookie,
         }
         return [by_kind[source.kind]]
 

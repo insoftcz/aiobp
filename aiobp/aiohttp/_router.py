@@ -3,6 +3,7 @@
 import inspect
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
+from enum import Enum
 from functools import wraps
 from typing import Any, Optional, TypeVar
 
@@ -19,6 +20,17 @@ from ._provider import InjectorFactory, Provider
 T = TypeVar("T", bound=Callable[..., Awaitable[Any]])
 
 
+class RouterType(str, Enum):
+    """Whether a route is documented in OpenAPI/Swagger or served as a plain, undocumented route."""
+
+    API = "api"
+    PLAIN = "plain"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
+
+
 @dataclass
 class _PendingRoute:
     """Route collected by a decorator, registered later by build()."""
@@ -26,7 +38,7 @@ class _PendingRoute:
     handler: Callable[..., Any]
     method: str
     path: str
-    router_type: str  # "api" or "plain"
+    router_type: RouterType
     content_type: Optional[str] = None
     charset: str = "utf-8"
     tag: Optional[str] = None
@@ -45,7 +57,7 @@ class ApiRouter:
         on_error: Optional[Callable[[BaseException], Any]] = None,
     ) -> None:
         self._pending: list[_PendingRoute] = pending
-        self._router_type: str = "api"
+        self._router_type: RouterType = RouterType.API
         self._default_content_type: str = default_content_type
         self._default_charset: str = default_charset
         self.on_result: Optional[Callable[[Any], Any]] = on_result
@@ -124,9 +136,13 @@ class Router(web.RouteTableDef):
     def add_type_injector(self, typ: type, factory: InjectorFactory) -> None:
         self._type_injectors[typ] = factory
 
-    def mount_docs(self, prefix: str = "") -> None:
+    def _mount_docs(self) -> None:
         """Serve OpenAPI JSON spec and Swagger UI."""
-        url = f"{prefix}/openapi.json"
+        if self.openapi.prefix is None:
+            log.debug("Not mounting OpenAPI docs, router.openapi.prefix is None")
+            return
+
+        url = f"{self.openapi.prefix}/openapi.json"
         spec = self.openapi.build()
         docs = self.openapi.swagger_ui_html(url)
 
@@ -134,11 +150,11 @@ class Router(web.RouteTableDef):
         async def openapi_json() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
             return spec
 
-        @self.get(f"{prefix}/docs")
+        @self.get(f"{self.openapi.prefix}/docs")
         async def swagger_ui() -> str:  # pyright: ignore[reportUnusedFunction]
             return docs
 
-        log.info("API docs available at %s/docs", prefix)
+        log.info("API docs available at %s/docs", self.openapi.prefix)
 
     @override
     def route(self, method: str, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
@@ -149,7 +165,7 @@ class Router(web.RouteTableDef):
                 handler=handler,
                 method=method,
                 path=path,
-                router_type="plain",
+                router_type=RouterType.PLAIN,
                 content_type=ct,
                 charset=self._default_charset,
             ))
@@ -208,7 +224,7 @@ class Router(web.RouteTableDef):
                     router_type=p.router_type,
                     content_type=p.content_type,
                     charset=p.charset,
-                    tag=p.tag if p.tag is not None else (tag if p.router_type == "api" else None),
+                    tag=p.tag if p.tag is not None else (tag if p.router_type == RouterType.API else None),
                     secure=p.secure,
                 ))
 
@@ -218,6 +234,14 @@ class Router(web.RouteTableDef):
             return
         self._built = True
 
+        self._process_pending()
+        # docs needs to have router table populated
+        self._mount_docs()
+        # but they add routes so we have to process them
+        self._process_pending()
+
+    def _process_pending(self) -> None:
+        """Register pending decorators"""
         registered: set[tuple[str, str]] = set()
         for entry in self._pending:
             key = (entry.method, entry.path)
@@ -245,7 +269,7 @@ class Router(web.RouteTableDef):
         # Read live off self.api (not snapshotted at decoration time) so that setting
         # router.api.on_result/on_error after routes are decorated still takes effect —
         # this runs once, lazily, at build() time.
-        is_api_route = entry.router_type == "api"
+        is_api_route = entry.router_type == RouterType.API
         on_result = self.api.on_result if is_api_route else None
         on_error = self.api.on_error if is_api_route else None
         provider = Provider(handler, self._type_injectors)
@@ -275,12 +299,12 @@ class Router(web.RouteTableDef):
             return provider.encode_response(result, content_type=content_type, charset=charset)
 
         self._items.append(web.RouteDef(entry.method, entry.path, wrapped, {}))
-        log.debug("%-4s %-7s %s", entry.router_type, entry.method, entry.path)
+        log.debug("%-5s %-7s %s", entry.router_type, entry.method, entry.path)
 
-        if entry.router_type == "api":
+        if entry.router_type == RouterType.API:
             self.openapi.add_route(
                 entry.method, entry.path, entry.handler, self._type_injectors,
-                tag=entry.tag, secure=entry.secure,
+                tag=entry.tag, secure=entry.secure, content_type=entry.content_type,
             )
 
     @override
