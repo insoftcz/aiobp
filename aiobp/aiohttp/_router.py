@@ -201,7 +201,30 @@ class Router(web.RouteTableDef):
         return self.route(hdrs.METH_OPTIONS, path, content_type=content_type, **kwargs)
 
     def include(self, instance: object) -> None:
-        """Replace unbound class methods in _pending with bound methods from *instance*."""
+        """Replace unbound class methods in _pending with bound methods from *instance*.
+
+        Also accepts a module. Route-decorated free functions need no binding
+        (they aren't methods), so this instead assigns a fallback OpenAPI tag —
+        the module's ``__tag__`` if it defines one, else the last segment of its
+        ``__name__`` — to any of its API routes that don't already have one.
+        This also turns "import a routes module purely to run its decorators"
+        into a real use of that import, so static analysis stops flagging it
+        as unused::
+
+            from myapp.api import users
+            router.include(users)
+        """
+        if inspect.ismodule(instance):
+            tag = getattr(instance, "__tag__", None) or instance.__name__.rsplit(".", 1)[-1]
+            for p in self._pending:
+                if (
+                    p.tag is None
+                    and p.router_type == RouterType.API
+                    and getattr(p.handler, "__module__", None) == instance.__name__
+                ):
+                    p.tag = tag
+            return
+
         tag = type(instance).__name__
         seen: set[int] = set()
         for attr_name in dir(instance):

@@ -1,6 +1,8 @@
 """Unit tests for aiobp.aiohttp"""
 
 import socket
+import sys
+import types
 import unittest
 from io import BytesIO
 from typing import Annotated, Any, Optional, TypedDict, Union
@@ -31,6 +33,7 @@ from aiobp.aiohttp import (
     range_headers,
 )
 from aiobp.aiohttp._connection import get_client_address, get_server_hostname
+from aiobp.aiohttp._openapi import OpenAPIBuilder
 from aiobp.aiohttp._provider import Provider
 
 # ---------------------------------------------------------------------------
@@ -1500,6 +1503,79 @@ class TestUnboundSelfDetection(unittest.TestCase):
             router.build()
 
 
+class TestIncludeModule(unittest.TestCase):
+    """router.include() also accepts a module: a real use of the import, plus auto-tagging."""
+
+    def test_include_module_is_a_noop_for_unrelated_module(self) -> None:
+        router = Router()
+
+        @router.api.get("/greet")
+        async def greet() -> str:
+            return "hi"
+
+        routes_module = types.ModuleType("fake_routes_module")
+        routes_module.greet = greet  # type: ignore[attr-defined]
+
+        pending_before = list(router._pending)
+        router.include(routes_module)
+        self.assertEqual(router._pending, pending_before)
+
+    def test_include_module_does_not_raise(self) -> None:
+        router = Router()
+
+        @router.get("/plain")
+        async def plain() -> str:
+            return "hi"
+
+        router.include(sys.modules[__name__])
+        self.assertEqual(len(router._pending), 1)
+
+    def test_include_module_tags_untagged_api_routes_with_last_name_segment(self) -> None:
+        router = Router()
+
+        @router.api.get("/greet")
+        async def greet() -> str:
+            return "hi"
+
+        fake_module = types.ModuleType(__name__)
+        router.include(fake_module)
+        self.assertEqual(router._pending[0].tag, __name__.rsplit(".", 1)[-1])
+
+    def test_include_module_dunder_tag_overrides_default(self) -> None:
+        router = Router()
+
+        @router.api.get("/greet")
+        async def greet() -> str:
+            return "hi"
+
+        fake_module = types.ModuleType(__name__)
+        fake_module.__tag__ = "CustomTag"  # type: ignore[attr-defined]
+        router.include(fake_module)
+        self.assertEqual(router._pending[0].tag, "CustomTag")
+
+    def test_include_module_does_not_override_explicit_tag(self) -> None:
+        router = Router()
+
+        @router.api.get("/greet", tag="Explicit")
+        async def greet() -> str:
+            return "hi"
+
+        fake_module = types.ModuleType(__name__)
+        router.include(fake_module)
+        self.assertEqual(router._pending[0].tag, "Explicit")
+
+    def test_include_module_does_not_tag_plain_routes(self) -> None:
+        router = Router()
+
+        @router.get("/plain")
+        async def plain() -> str:
+            return "hi"
+
+        fake_module = types.ModuleType(__name__)
+        router.include(fake_module)
+        self.assertIsNone(router._pending[0].tag)
+
+
 # ---------------------------------------------------------------------------
 # Router.include() integration tests (stateful — real aiohttp test server)
 # ---------------------------------------------------------------------------
@@ -1588,6 +1664,190 @@ class TestRouterInclude(AioHTTPTestCase):
             self.assertEqual(await resp.json(), '42')
         finally:
             await client.close()
+
+
+# ---------------------------------------------------------------------------
+# OpenAPIBuilder parameter/requestBody classification
+# ---------------------------------------------------------------------------
+
+class TestOpenAPIBuilderInfo(unittest.TestCase):
+
+    def test_description_is_omitted_by_default(self) -> None:
+        spec = OpenAPIBuilder().build()
+        self.assertNotIn("description", spec["info"])
+
+    def test_description_is_included_when_set(self) -> None:
+        builder = OpenAPIBuilder()
+        builder.description = "Responses are wrapped in {success, data}."
+        spec = builder.build()
+        self.assertEqual(spec["info"]["description"], "Responses are wrapped in {success, data}.")
+
+
+class TestOpenAPIBuilderParameters(unittest.TestCase):
+
+    def _operation(self, handler) -> dict:
+        builder = OpenAPIBuilder()
+        builder.add_route("GET", "/x/{who}", handler, {})
+        return builder._paths["/x/{who}"]["get"]
+
+    def test_plain_path_param(self) -> None:
+        async def handler(who: Annotated[str, Meta(description="name")]) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"], [{
+            "name": "who", "in": "path", "required": True, "schema": {"type": "string"},
+            "description": "name",
+        }])
+
+    def test_plain_query_param(self) -> None:
+        async def handler(who: Annotated[str, Meta(description="name")], age: Annotated[int, Meta(description="n")]) -> str: ...
+        op = self._operation(handler)
+        age_param = next(p for p in op["parameters"] if p["name"] == "age")
+        self.assertEqual(age_param["in"], "query")
+
+    def test_path_key_is_in_path(self) -> None:
+        async def handler(who: PathKey[str, "someone"]) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"][0]["in"], "path")
+
+    def test_query_key_is_in_query(self) -> None:
+        async def handler(who: QueryKey[str, "someone"]) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"][0]["in"], "query")
+
+    def test_header_key_is_in_header(self) -> None:
+        async def handler(token: HeaderKey[str, "auth"]) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"][0]["in"], "header")
+
+    def test_cookie_key_is_in_cookie(self) -> None:
+        async def handler(session: CookieKey[str, "session"]) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"][0]["in"], "cookie")
+
+    def test_from_body_struct_becomes_request_body_not_query_param(self) -> None:
+        class UserSettings(msgspec.Struct):
+            active: bool
+
+        async def handler(user: FromBody[UserSettings, Param("User settings")]) -> int: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"], [])
+        self.assertIn("requestBody", op)
+        schema = op["requestBody"]["content"]["application/json"]["schema"]
+        self.assertEqual(schema, {"$ref": "#/components/schemas/UserSettings"})
+
+    def test_from_body_struct_docstring_is_dedented_in_schema(self) -> None:
+        class UserSettings(msgspec.Struct):
+            """Fields accepted when creating or updating a user
+
+            Fields left unset are omitted from the request, so on PATCH they
+            leave the existing value untouched.
+            """
+
+            active: bool
+
+        async def handler(user: FromBody[UserSettings, Param("User settings")]) -> int: ...
+        builder = OpenAPIBuilder()
+        builder.add_route("GET", "/x", handler, {})
+        description = builder._schemas["UserSettings"]["description"]
+        for line in description.splitlines():
+            self.assertFalse(line.startswith(" "), f"line has leftover indentation: {line!r}")
+        self.assertIn("Fields accepted when creating or updating a user", description)
+
+    def test_body_key_becomes_request_body_property(self) -> None:
+        async def handler(
+            grant_type: Annotated[str, Meta(description="grant type"), BodyKey],
+        ) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"], [])
+        schema = op["requestBody"]["content"]["application/json"]["schema"]
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["properties"]["grant_type"]["description"], "grant type")
+        self.assertIn("grant_type", schema["required"])
+
+    def test_from_query_struct_expands_into_query_params(self) -> None:
+        class Paging(msgspec.Struct):
+            limit: int
+            offset: int
+
+        async def handler(paging: FromQuery[Paging, "pagination"]) -> str: ...
+        op = self._operation(handler)
+        names = {p["name"]: p["in"] for p in op["parameters"]}
+        self.assertEqual(names, {"limit": "query", "offset": "query"})
+
+    def test_from_path_struct_expands_into_path_params(self) -> None:
+        class Segments(msgspec.Struct):
+            user_id: int
+
+        async def handler(segments: FromPath[Segments, "segments"]) -> str: ...
+        op = self._operation(handler)
+        self.assertEqual(op["parameters"], [{
+            "name": "user_id", "in": "path", "required": True, "schema": {"type": "integer"},
+        }])
+
+    def test_request_body_gets_a_synthesized_example(self) -> None:
+        class PhoneSelector(msgspec.Struct, kw_only=True):
+            identifier: Optional[Annotated[str, Meta(description="Device identificator", examples=["1001"])]] = None
+            extension: Optional[str] = None
+
+        async def handler(sel: FromBody[PhoneSelector, "selector"]) -> None: ...
+        op = self._operation(handler)
+        example = op["requestBody"]["content"]["application/json"]["example"]
+        self.assertEqual(example["identifier"], "1001")
+        self.assertIsNotNone(example["extension"])
+
+    def test_response_gets_a_synthesized_example(self) -> None:
+        class Item(msgspec.Struct, kw_only=True):
+            name: Annotated[str, Meta(examples=["widget"])]
+            note: Optional[str] = None
+
+        async def handler() -> Item: ...
+        op = self._operation(handler)
+        example = op["responses"]["200"]["content"]["application/json"]["example"]
+        self.assertEqual(example["name"], "widget")
+        self.assertIsNotNone(example["note"])
+
+
+class TestExampleFor(unittest.TestCase):
+    """OpenAPIBuilder._example_for() digs into anyOf branches instead of showing null."""
+
+    def test_plain_examples_used_directly(self) -> None:
+        builder = OpenAPIBuilder()
+        self.assertEqual(builder._example_for({"type": "string", "examples": ["a"]}), "a")
+
+    def test_optional_field_uses_non_null_branch_examples(self) -> None:
+        builder = OpenAPIBuilder()
+        schema = {
+            "anyOf": [
+                {"type": "string", "description": "Device identificator", "examples": ["1001"]},
+                {"type": "null"},
+            ],
+            "default": None,
+        }
+        self.assertEqual(builder._example_for(schema), "1001")
+
+    def test_optional_field_without_examples_falls_back_to_type_default(self) -> None:
+        builder = OpenAPIBuilder()
+        schema = {"anyOf": [{"type": "integer"}, {"type": "null"}], "default": None}
+        self.assertEqual(builder._example_for(schema), 0)
+
+    def test_object_with_optional_fields_none_are_null(self) -> None:
+        builder = OpenAPIBuilder()
+        schema = {
+            "type": "object",
+            "properties": {
+                "identifier": {
+                    "anyOf": [
+                        {"type": "string", "examples": ["1001"]},
+                        {"type": "null"},
+                    ],
+                },
+                "extension": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+        }
+        example = builder._example_for(schema)
+        self.assertEqual(example["identifier"], "1001")
+        self.assertIsNotNone(example["extension"])
+
 
 if __name__ == "__main__":
     unittest.main()

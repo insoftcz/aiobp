@@ -8,7 +8,7 @@ from typing import Annotated, Any, Optional, get_args, get_origin
 import msgspec
 from msgspec import Meta
 
-from ._provider import Provider
+from ._provider import Provider, SourceKind
 
 # Mapping from Python built-in types to OpenAPI schema types.
 _TYPE_MAP: dict[type, dict[str, str]] = {
@@ -16,6 +16,16 @@ _TYPE_MAP: dict[type, dict[str, str]] = {
     int: {"type": "integer"},
     float: {"type": "number"},
     bool: {"type": "boolean"},
+}
+
+# SourceKind -> OpenAPI parameter "in" location, for the single-value sources.
+# BODY/BODY_KEY become requestBody instead; PATH_ITEMS/QUERY_ITEMS expand into
+# one parameter per struct/TypedDict field (see add_route).
+_PARAM_LOCATION_BY_KIND: dict[SourceKind, str] = {
+    SourceKind.PATH: "path",
+    SourceKind.QUERY: "query",
+    SourceKind.HEADER: "header",
+    SourceKind.COOKIE: "cookie",
 }
 
 _PATH_PARAM_RE = re.compile(r"\{(\w+)\}")
@@ -42,6 +52,19 @@ def _split_docstring(doc: Optional[str]) -> tuple[str, str]:
     return summary, rest.strip("\n")
 
 
+def _clean_description(doc: Optional[str]) -> str:
+    """Dedent a docstring-derived description (e.g. from a msgspec Struct) into one string.
+
+    JSON Schema's ``description`` has no separate summary/description split like an
+    OpenAPI operation does, so this reuses ``_split_docstring`` and joins the parts
+    back together — the point is the dedenting, not the split.
+    """
+    summary, description = _split_docstring(doc)
+    if not description:
+        return summary
+    return f"**{summary}**\n___\n{description}"
+
+
 def _unwrap_return(annotation: Any) -> tuple[Any, Optional[str]]:
     """Split a return annotation into (type, description), unwrapping Annotated[type, Meta(...)]."""
     if get_origin(annotation) is not Annotated:
@@ -58,6 +81,7 @@ class OpenAPIBuilder:
         self.prefix: Optional[str] = ""  # where to mount /docs (don't automount them when None)
         self.title: str = "API"
         self.version: str = "0.0.0"
+        self.description: Optional[str] = None
         self._paths: dict[str, Any] = {}
         self._schemas: dict[str, Any] = {}
         self._security_schemes: dict[str, Any] = {}
@@ -94,30 +118,52 @@ class OpenAPIBuilder:
             self._global_security.append({"OAuth2": list((scopes or {}).keys())})
 
     def _response_schema(self, typ: Any) -> dict[str, Any]:
-        """Build a JSON Schema for a return type, registering any nested structs as components."""
+        """Build a JSON Schema for a type, registering any nested structs as components."""
         if typ is bytes:
             return {"type": "string", "format": "binary"}
         (schema,), components = msgspec.json.schema_components(
             [typ], ref_template="#/components/schemas/{name}",
         )
+        # msgspec pulls Struct/TypedDict docstrings straight into "description" with
+        # their original class-body indentation intact — dedent it, or Swagger UI's
+        # Markdown renderer treats the indentation as a code block.
+        for component in components.values():
+            if "description" in component:
+                component["description"] = _clean_description(component["description"])
+        if "description" in schema:
+            schema["description"] = _clean_description(schema["description"])
+
         self._schemas.update(components)
+        return schema
+
+    def _resolve_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Follow a single ``$ref`` into the registered component schemas."""
+        if "$ref" in schema:
+            name = schema["$ref"].rsplit("/", 1)[-1]
+            return self._schemas.get(name, {})
         return schema
 
     def _example_for(self, schema: dict[str, Any]) -> Any:  # noqa: ANN401, PLR0911
         """Synthesize a representative example value from a JSON Schema.
 
-        Swagger UI can't generate an example for JSON Schema tuple validation
-        (``prefixItems``/``items: false``, which is how msgspec renders a Python
-        ``tuple``) — it shows ``null`` for every slot instead. Build the example
-        ourselves from field-level ``examples`` so tuple-shaped responses render.
+        Swagger UI's own example generation has two known blind spots this works
+        around: it can't handle JSON Schema tuple validation (``prefixItems``,
+        how msgspec renders a Python ``tuple``) — showing ``null`` for every
+        slot — and for an ``Optional[T]`` field (rendered as ``anyOf: [T, {type:
+        null}]``) it uses the field's top-level ``default`` (``null``) instead of
+        digging into the non-null branch for its ``description``/``examples``.
         """
-        if "$ref" in schema:
-            name = schema["$ref"].rsplit("/", 1)[-1]
-            return self._example_for(self._schemas.get(name, {}))
+        schema = self._resolve_schema(schema)
         if schema.get("examples"):
             return schema["examples"][0]
         if "example" in schema:
             return schema["example"]
+
+        if "anyOf" in schema:
+            for branch in schema["anyOf"]:
+                if branch.get("type") != "null":
+                    return self._example_for(branch)
+            return None
 
         schema_type = schema.get("type")
         if schema_type == "object":
@@ -130,7 +176,7 @@ class OpenAPIBuilder:
 
         return {"string": "", "integer": 0, "number": 0.0, "boolean": False}.get(schema_type)
 
-    def add_route(  # noqa: PLR0913
+    def add_route(  # noqa: C901, PLR0912, PLR0913, PLR0915
         self,
         method: str,
         path: str,
@@ -146,12 +192,15 @@ class OpenAPIBuilder:
         secure=False — mark this endpoint as public (overrides global security).
         secure=None  — inherit global security (default).
         """
-
         openapi_path = _PATH_PARAM_RE.sub(r"{\1}", path)
         path_param_names = _path_param_names(openapi_path)
         sig = inspect.signature(handler)
 
         parameters: list[dict[str, Any]] = []
+        request_body_schema: Optional[dict[str, Any]] = None
+        body_key_properties: dict[str, Any] = {}
+        body_key_required: list[str] = []
+
         for param in sig.parameters.values():
             annotation: Any = param.annotation
 
@@ -160,7 +209,7 @@ class OpenAPIBuilder:
                 continue
 
             try:
-                arg_type, optional, meta, _source = Provider.get_annotation(annotation)
+                arg_type, optional, meta, source = Provider.get_annotation(annotation)
             except TypeError:
                 continue
 
@@ -168,9 +217,48 @@ class OpenAPIBuilder:
             if arg_type in type_injectors:
                 continue
 
-            location = "path" if param.name in path_param_names else "query"
             default = None if param.default is inspect.Parameter.empty else param.default
             required = not optional and default is None
+            kind = source.kind if source is not None else None
+
+            if kind == SourceKind.BODY:
+                # Whole request body — takes precedence over any BodyKey fields below.
+                request_body_schema = self._response_schema(arg_type)
+                continue
+
+            if kind == SourceKind.BODY_KEY:
+                # One named field of the body; merged into a synthesized object schema.
+                field_schema = dict(_schema_for(arg_type))
+                if meta is not None and meta.description:
+                    field_schema["description"] = meta.description
+                if meta is not None and meta.examples:
+                    field_schema["example"] = meta.examples[0]
+                if default is not None:
+                    field_schema["default"] = default
+                body_key_properties[param.name] = field_schema
+                if required:
+                    body_key_required.append(param.name)
+                continue
+
+            if kind in (SourceKind.PATH_ITEMS, SourceKind.QUERY_ITEMS):
+                # Whole path/query mapping — expand the struct/TypedDict into one
+                # parameter per field, since OpenAPI has no "bulk" parameter concept.
+                location = "path" if kind == SourceKind.PATH_ITEMS else "query"
+                obj_schema = self._resolve_schema(self._response_schema(arg_type))
+                required_fields = set(obj_schema.get("required", []))
+                for field_name, field_schema in obj_schema.get("properties", {}).items():
+                    parameters.append({
+                        "name": field_name,
+                        "in": location,
+                        "required": location == "path" or field_name in required_fields,
+                        "schema": field_schema,
+                    })
+                continue
+
+            if kind is None:
+                location = "path" if param.name in path_param_names else "query"
+            else:
+                location = _PARAM_LOCATION_BY_KIND.get(kind, "query")
 
             entry: dict[str, Any] = {
                 "name": param.name,
@@ -187,6 +275,11 @@ class OpenAPIBuilder:
 
             parameters.append(entry)
 
+        if request_body_schema is None and body_key_properties:
+            request_body_schema = {"type": "object", "properties": body_key_properties}
+            if body_key_required:
+                request_body_schema["required"] = body_key_required
+
         return_type, return_description = _unwrap_return(sig.return_annotation)
         success: dict[str, Any] = {"description": return_description or "Success"}
         if sig.return_annotation is not inspect.Signature.empty:
@@ -195,9 +288,7 @@ class OpenAPIBuilder:
             except TypeError:
                 pass
             else:
-                media_type: dict[str, Any] = {"schema": schema}
-                if "prefixItems" in schema:
-                    media_type["example"] = self._example_for(schema)
+                media_type: dict[str, Any] = {"schema": schema, "example": self._example_for(schema)}
                 success["content"] = {content_type or "application/json": media_type}
 
         summary, description = _split_docstring(handler.__doc__)
@@ -211,6 +302,14 @@ class OpenAPIBuilder:
                 "400": {"description": "Bad request — missing or invalid parameter"},
             },
         }
+        if request_body_schema is not None:
+            operation["requestBody"] = {
+                "required": True,
+                "content": {"application/json": {
+                    "schema": request_body_schema,
+                    "example": self._example_for(request_body_schema),
+                }},
+            }
         if tag:
             operation["tags"] = [tag]
         if secure is True:
@@ -224,9 +323,12 @@ class OpenAPIBuilder:
         # 3.2 (not 3.0) because schemas come straight from msgspec.json.schema, which speaks
         # JSON Schema 2020-12 — e.g. prefixItems for tuples, plural "examples" — and OpenAPI
         # 3.0's Schema Object (JSON-Schema-draft-4-ish) can't represent either.
+        info: dict[str, Any] = {"title": self.title, "version": self.version}
+        if self.description:
+            info["description"] = self.description
         spec: dict[str, Any] = {
             "openapi": "3.2.0",
-            "info": {"title": self.title, "version": self.version},
+            "info": info,
             "paths": self._paths,
         }
         components: dict[str, Any] = {}
