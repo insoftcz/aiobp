@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 
 - More production ready aiohttp stuff
 - Improved OpenAPI documentation for return types
+- Improved API error handling and switched to pytest
 
 
 ## [1.3.2] - 2026-07-14
