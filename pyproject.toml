@@ -33,6 +33,9 @@ aiohttp = [
 [dependency-groups]
 dev = [
     "mypy>=1.15.0",
+    "pytest>=8.4.2",
+    "pytest-aiohttp>=1.1.0",
+    "pytest-asyncio>=1.2.0",
     "ruff>=0.11.11",
 ]
 
@@ -47,10 +50,18 @@ ignore = ["D107", "D400", "D415", "FA100", "D101", "D102", "PERF203"]
 mypy-init-return = true
 
 [tool.ruff.per-file-ignores]
-"tests/*.py" = ["S101"]
+# PLR2004: pytest's plain `assert status == 200` (unlike unittest's assertEqual) is a
+# comparison, so ruff treats every literal status code/count in a test as a "magic value".
+# D103: test methods were exempt via D102 (missing docstring in method) under unittest
+# classes; pytest-style top-level test functions need the same exemption via D103.
+"tests/*.py" = ["S101", "PLR2004", "D103"]
 # provider.py and web.py use Python reflection APIs (inspect, get_origin, get_args)
 # and must override aiohttp base classes that use **kwargs: Any — ANN401 is unavoidable.
 "aiobp/aiohttp/_provider.py" = ["ANN401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.uv]
 package = true

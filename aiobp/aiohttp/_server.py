@@ -1,17 +1,13 @@
 """HTTP server"""
 
-from collections.abc import Awaitable
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from aiohttp import web
 from aiohttp.web_routedef import RouteTableDef
 
 from aiobp import log, on_shutdown
 
-from ._router import Router, router
-
-Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
-Middleware = Callable[[web.Request, Handler], Awaitable[web.StreamResponse]]
+from ._router import router
 
 
 class WebServer:

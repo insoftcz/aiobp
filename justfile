@@ -3,7 +3,7 @@ next_version := `git-cliff --bumped-version`
 create-changelog:
     git-cliff --bump -o CHANGELOG.md
 
-release: create-changelog
+release: test create-changelog
     awk -i inplace '{ sub(/^version = "[0-9]+\.[0-9]+\.[0-9]+"/, "version = \"{{next_version}}\"") }; { print }' pyproject.toml
     awk -i inplace '{ sub(/^__version__ = "[0-9]+\.[0-9]+\.[0-9]+"/, "__version__ = \"{{next_version}}\"") }; { print }' aiobp/__init__.py
     uv sync
@@ -11,7 +11,7 @@ release: create-changelog
     git commit -m {{next_version}}
     git tag -a {{next_version}} -m {{next_version}}
 
-publish:
+publish: test
     #!/bin/bash
     rm -rf dist
     uv build
@@ -19,10 +19,10 @@ publish:
     echo
     UV_PUBLISH_TOKEN="$token" uv publish
 
-push:
+push: test
     git push
     git push --tags
 
 test:
     uv sync --all-extras
-    uv run -m unittest discover -s tests
+    uv run -m pytest tests

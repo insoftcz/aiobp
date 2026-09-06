@@ -1,8 +1,9 @@
 """Test config loaders"""
 
 import logging
-import unittest
 from contextlib import contextmanager
+
+import pytest
 
 from aiobp.logging import suppress_and_log
 
@@ -29,51 +30,49 @@ def assert_no_logs(level: str = "ERROR"):
         raise AssertionError(f"Unexpected log records at {level}: {msgs}")
 
 
-class TestLogging(unittest.TestCase):
+def test_surpressed_exception(caplog: pytest.LogCaptureFixture) -> None:
+    try:
+        with caplog.at_level(logging.ERROR), suppress_and_log(KeyError):
+            raise KeyError
+    except KeyError:
+        raise AssertionError("Exception not surpressed")
+    assert any("Suppressed exception" in message for message in caplog.messages)
 
-    def test_surpressed_exception(self) -> None:
+
+def _assert_muted(mute: object, caplog: pytest.LogCaptureFixture) -> None:
+    """Assert KeyError is suppressed silently and TypeError is suppressed with logging."""
+    with assert_no_logs(level="ERROR"):
         try:
-            with self.assertLogs(level="ERROR") as cm:
-                with suppress_and_log(KeyError):
-                    raise KeyError
+            with suppress_and_log(KeyError, TypeError, mute=mute):  # type: ignore[arg-type]
+                raise KeyError
         except KeyError:
-            raise AssertionError("Exception not surpressed")
-        self.assertTrue(any("Suppressed exception" in msg for msg in cm.output))
+            raise AssertionError("Exception not suppressed")
 
-    def _assert_muted(self, mute: object) -> None:  # type: ignore[explicit-any]
-        """Assert KeyError is suppressed silently and TypeError is suppressed with logging."""
-        with assert_no_logs(level="ERROR"):
-            try:
-                with suppress_and_log(KeyError, TypeError, mute=mute):  # type: ignore[arg-type]
-                    raise KeyError
-            except KeyError:
-                raise AssertionError("Exception not suppressed")
-
-        with self.assertLogs(level="ERROR") as cm:
-            try:
-                with suppress_and_log(KeyError, TypeError, mute=mute):  # type: ignore[arg-type]
-                    raise TypeError
-            except TypeError:
-                raise AssertionError("Exception not suppressed")
-        self.assertTrue(any("Suppressed exception" in msg for msg in cm.output))
-
-    def test_muted_exception_tuple(self) -> None:
-        self._assert_muted((KeyError,))
-
-    def test_muted_exception_list(self) -> None:
-        self._assert_muted([KeyError])
-
-    def test_muted_exception_single_type(self) -> None:
-        self._assert_muted(KeyError)
-
-    def test_not_surpressed_exception(self) -> None:
+    with caplog.at_level(logging.ERROR):
         try:
-            with suppress_and_log(KeyError):
+            with suppress_and_log(KeyError, TypeError, mute=mute):  # type: ignore[arg-type]
                 raise TypeError
-            raise AssertionError("Not listed exception was surpressed")
         except TypeError:
-            pass
+            raise AssertionError("Exception not suppressed")
+    assert any("Suppressed exception" in message for message in caplog.messages)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_muted_exception_tuple(caplog: pytest.LogCaptureFixture) -> None:
+    _assert_muted((KeyError,), caplog)
+
+
+def test_muted_exception_list(caplog: pytest.LogCaptureFixture) -> None:
+    _assert_muted([KeyError], caplog)
+
+
+def test_muted_exception_single_type(caplog: pytest.LogCaptureFixture) -> None:
+    _assert_muted(KeyError, caplog)
+
+
+def test_not_surpressed_exception() -> None:
+    try:
+        with suppress_and_log(KeyError):
+            raise TypeError
+        raise AssertionError("Not listed exception was surpressed")
+    except TypeError:
+        pass

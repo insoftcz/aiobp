@@ -4,7 +4,7 @@ import inspect
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
-from typing import TYPE_CHECKING, Annotated, Any, Optional, Union, final, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Optional, Union, final, get_args, get_origin, get_type_hints
 
 import msgspec
 from aiohttp import web
@@ -32,6 +32,101 @@ class SourceKind(str, Enum):
     @override
     def __str__(self) -> str:
         return self.value
+
+
+class ApiError(web.HTTPException):
+    """Base for exceptions that are also a valid HTTP response.
+
+    Subclasses set ``status_code``/``response_type`` once, coupling the
+    exception to the ``msgspec.Struct`` that documents it in OpenAPI —
+    ``status_code`` is the same attribute aiohttp's own ``web.HTTPNotFound``
+    etc. already use, so there's exactly one source of truth. Because
+    ``ApiError`` *is* a ``web.HTTPException`` (an aiohttp ``Response`` in its
+    own right), raising a subclass is enough by itself — aiohttp serves it
+    directly with the right status code and a JSON body built from
+    ``to_response()``, with no router-level special-casing required, exactly
+    like raising a plain ``web.HTTPNotFound()`` already works.
+    """
+
+    response_type: ClassVar[type[msgspec.Struct]]
+
+    def __init__(self, message: str = "") -> None:
+        text = msgspec.json.encode(self.to_response()).decode()
+        super().__init__(text=text, content_type="application/json")
+        self.args = (message or self.reason,)
+
+    def to_response(self) -> msgspec.Struct:
+        """Build the ``response_type`` instance describing this error."""
+        raise NotImplementedError
+
+
+class ArgumentError(TypeError):
+    """A single handler argument failed to resolve or validate.
+
+    Carries structured detail — which argument, where it was supposed to
+    come from, and why it failed — so the router can build a proper 400
+    response body instead of a bare string.
+    """
+
+    def __init__(self, attribute: str, source: Optional[SourceKind], error: str) -> None:
+        self.attribute: str = attribute
+        self.source: Optional[SourceKind] = source
+        self.error: str = error
+        location = source.value if source is not None else "unknown"
+        super().__init__(f"{attribute} ({location}): {error}")
+
+
+class ArgumentValidationError(msgspec.Struct):
+    """A single handler argument that failed to resolve or validate."""
+
+    attribute: str
+    source: Optional[SourceKind]
+    error: str
+
+
+class ValidationErrorResponse(msgspec.Struct):
+    """List of request arguments that failed validation."""
+
+    errors: list[ArgumentValidationError]
+
+
+class RequestValidationError(ApiError, TypeError):
+    """Aggregates every ``ArgumentError`` raised while gathering a request's arguments."""
+
+    status_code = 400
+    response_type = ValidationErrorResponse
+
+    def __init__(self, errors: list[ArgumentError]) -> None:
+        self.errors: list[ArgumentError] = errors
+        super().__init__("; ".join(str(error) for error in errors))
+
+    def to_response(self) -> ValidationErrorResponse:
+        return ValidationErrorResponse(errors=[
+            ArgumentValidationError(attribute=e.attribute, source=e.source, error=e.error) for e in self.errors
+        ])
+
+
+class ServerErrorResponse(msgspec.Struct):
+    """An unhandled exception raised while executing the method."""
+
+    error: str
+
+
+class ServerError(ApiError):
+    """Wraps an unexpected exception raised while executing a handler, for a structured 500."""
+
+    status_code = 500
+    response_type = ServerErrorResponse
+
+    def __init__(self, error: BaseException) -> None:
+        self.error: BaseException = error
+        super().__init__(str(error))
+
+    def to_response(self) -> ServerErrorResponse:
+        # Never leak the original exception's message to the client — it can
+        # contain internal details (paths, connection strings, ...). The full
+        # traceback is logged server-side instead; see _router.py's wrapped().
+        return ServerErrorResponse(error="Internal Server Error")
 
 
 @final
@@ -189,7 +284,13 @@ class Provider:
                         self._get_path_mapping if source.kind == SourceKind.PATH_ITEMS else self._get_query_mapping
                     )
                     self._args[param.name] = partial(
-                        self._get_mapping, param.name, get_mapping, arg_type, optional=optional, default=default,
+                        self._get_mapping,
+                        param.name,
+                        get_mapping,
+                        arg_type,
+                        optional=optional,
+                        default=default,
+                        source_kind=source.kind,
                     )
                 else:
                     self._args[param.name] = partial(
@@ -201,6 +302,7 @@ class Provider:
                         sources=self._sources_for(source),
                         meta=meta,
                         source_name=self._source_name(param.name, meta),
+                        source_kind=source.kind if source is not None else None,
                     )
             except TypeError:
                 msg = (
@@ -242,6 +344,7 @@ class Provider:
         request: web.Request,
         meta: Optional[Meta] = None,
         source_name: Optional[str] = None,
+        source_kind: Optional[SourceKind] = None,
     ) -> Any:
         """Take value for one argument from source and validate it"""
         key = source_name or name
@@ -250,11 +353,12 @@ class Provider:
             value = source(key, request)
             if value is not None:
                 break
-        return self._format_value(name, typ, value, optional=optional, default=default, meta=meta)
+        return self._format_value(name, typ, value, optional=optional, default=default, meta=meta, source=source_kind)
 
     @staticmethod
     def _format_value(  # noqa: PLR0913
         name: str, typ: type, value: Any, *, optional: bool, default: Any, meta: Optional[Meta],
+        source: Optional[SourceKind] = None,
     ) -> Any:
         """Apply the default fallback, then validate/coerce a single raw value.
 
@@ -267,15 +371,13 @@ class Provider:
         if value is None:
             if optional:
                 return None
-            msg = f"Missing required value {name}"
-            raise TypeError(msg)
+            raise ArgumentError(name, source, "Missing required value")
 
         if meta is not None:
             try:
                 return msgspec.convert(value, type=Annotated[typ, meta], strict=False)
             except msgspec.ValidationError as error:
-                msg = f"Invalid value for {name}: {error}"
-                raise TypeError(msg) from error
+                raise ArgumentError(name, source, str(error)) from error
 
         return typ(value)
 
@@ -302,9 +404,11 @@ class Provider:
                 form = await request.post()
                 value = form.get(key)
         except msgspec.DecodeError as exc:
-            raise TypeError(str(exc)) from exc
+            raise ArgumentError(name, SourceKind.BODY_KEY, str(exc)) from exc
 
-        return self._format_value(name, typ, value, optional=optional, default=default, meta=meta)
+        return self._format_value(
+            name, typ, value, optional=optional, default=default, meta=meta, source=SourceKind.BODY_KEY,
+        )
 
     async def _get_body(
         self, name: str, typ: type, *, optional: bool, default: Any, request: web.Request,
@@ -320,8 +424,7 @@ class Provider:
                 if not raw:
                     if optional:
                         return default
-                    msg = f"Missing required body for {name}"
-                    raise TypeError(msg)
+                    raise ArgumentError(name, SourceKind.BODY, "Missing required body")
                 return msgspec.json.decode(raw, type=typ)
 
             # form-urlencoded or multipart → convert the whole form into typ,
@@ -331,12 +434,11 @@ class Provider:
             if not data:
                 if optional:
                     return default
-                msg = f"Missing required body for {name}"
-                raise TypeError(msg)
+                raise ArgumentError(name, SourceKind.BODY, "Missing required body")
             return msgspec.convert(data, type=typ, strict=False)
 
         except (msgspec.DecodeError, msgspec.ValidationError) as exc:
-            raise TypeError(str(exc)) from exc
+            raise ArgumentError(name, SourceKind.BODY, str(exc)) from exc
 
     def _get_mapping(  # noqa: PLR0913
         self,
@@ -346,6 +448,7 @@ class Provider:
         *,
         optional: bool,
         default: Any,
+        source_kind: SourceKind,
         request: web.Request,
     ) -> Any:
         """Resolve a handler argument by converting an entire request mapping (path or query)."""
@@ -353,13 +456,12 @@ class Provider:
         if not data:
             if optional:
                 return default
-            msg = f"Missing required value {name}"
-            raise TypeError(msg)
+            raise ArgumentError(name, source_kind, "Missing required value")
 
         try:
             return msgspec.convert(data, type=typ, strict=False)
         except msgspec.ValidationError as exc:
-            raise TypeError(str(exc)) from exc
+            raise ArgumentError(name, source_kind, str(exc)) from exc
 
     @staticmethod
     def _mapping_to_dict(mapping: Any, typ: type) -> dict[str, Any]:
@@ -447,18 +549,18 @@ class Provider:
 
     async def gather_args(self, request: web.Request) -> dict[str, Any]:
         args: list[tuple[str, Any]] = []
-        errors: list[tuple[str, str]] = []
+        errors: list[ArgumentError] = []
         for key, getter in self._args.items():
             try:
                 result = getter(request=request)
                 if inspect.isawaitable(result):
                     result = await result
                 args.append((key, result))
-            except ValueError as error:
-                errors.append((key, str(error)))
+            except ArgumentError as error:
+                errors.append(error)
 
         if errors:
-            raise TypeError(errors)
+            raise RequestValidationError(errors)
 
         return dict(args)
 

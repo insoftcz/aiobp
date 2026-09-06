@@ -2,7 +2,7 @@
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
 from typing import Any, Optional, TypeVar
@@ -15,9 +15,37 @@ from aiobp import log
 from ._connection import ClientAddress, ServerHostname, get_client_address, get_server_hostname
 from ._http_range import HttpRangeRequest
 from ._openapi import OpenAPIBuilder
-from ._provider import InjectorFactory, Provider
+from ._provider import InjectorFactory, Provider, ServerError
 
 T = TypeVar("T", bound=Callable[..., Awaitable[Any]])
+
+
+def _handle_unexpected_error(  # noqa: PLR0913
+    error: Exception,
+    request: web.Request,
+    *,
+    on_error: Optional[Callable[[str, str, BaseException], Any]],
+    is_api_route: bool,
+    provider: Provider,
+    content_type: Optional[str],
+    charset: str,
+) -> web.StreamResponse:
+    """Render an exception that isn't a ``web.HTTPException`` (so didn't already carry its own response).
+
+    ``on_error``, if configured, always wins — it's a deliberate global envelope.
+    Otherwise API routes get a structured, logged 500; plain routes re-raise
+    unchanged, same as always.
+    """
+    if on_error is not None:
+        return provider.encode_response(
+            on_error(request.method, request.path, error), content_type=content_type, charset=charset, status=500,
+        )
+    if not is_api_route:
+        raise error
+    log.exception("Unhandled exception in %s %s", request.method, request.path)
+    return provider.encode_response(
+        ServerError(error).to_response(), content_type=content_type, charset=charset, status=500,
+    )
 
 
 class RouterType(str, Enum):
@@ -43,6 +71,8 @@ class _PendingRoute:
     charset: str = "utf-8"
     tag: Optional[str] = None
     secure: Optional[bool] = None
+    responses: Optional[dict[int, type]] = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 class ApiRouter:
@@ -53,17 +83,17 @@ class ApiRouter:
         pending: list[_PendingRoute],
         default_content_type: str = "application/json",
         default_charset: str = "utf-8",
-        on_result: Optional[Callable[[Any], Any]] = None,
-        on_error: Optional[Callable[[BaseException], Any]] = None,
+        on_result: Optional[Callable[[str, str, Any], Any]] = None,
+        on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
     ) -> None:
         self._pending: list[_PendingRoute] = pending
         self._router_type: RouterType = RouterType.API
         self._default_content_type: str = default_content_type
         self._default_charset: str = default_charset
-        self.on_result: Optional[Callable[[Any], Any]] = on_result
-        self.on_error: Optional[Callable[[BaseException], Any]] = on_error
+        self.on_result: Optional[Callable[[str, str, Any], Any]] = on_result
+        self.on_error: Optional[Callable[[str, str, BaseException], Any]] = on_error
 
-    def route(
+    def route(  # noqa: PLR0913
         self,
         method: str,
         path: str,
@@ -71,7 +101,15 @@ class ApiRouter:
         tag: Optional[str] = None,
         secure: Optional[bool] = None,
         content_type: Optional[str] = None,
+        responses: Optional[dict[int, type]] = None,
+        **kwargs: Any,  # noqa: ANN401
     ) -> Callable[[T], T]:
+        """Register a route.
+
+        Unrecognized keyword arguments (e.g. ``name=``, ``allow_head=``) are
+        forwarded as-is to aiohttp's own route registration, matching
+        ``web.RouteTableDef``'s behaviour.
+        """
         ct = content_type or self._default_content_type
 
         def decorate(handler: T) -> T:
@@ -83,30 +121,32 @@ class ApiRouter:
                 content_type=ct,
                 charset=self._default_charset,
                 tag=tag, secure=secure,
+                responses=responses,
+                kwargs=kwargs,
             ))
             return handler
         return decorate
 
-    def get(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_GET, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def get(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_GET, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def post(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_POST, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def post(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_POST, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def put(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_PUT, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def put(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_PUT, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def patch(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_PATCH, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def patch(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_PATCH, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def delete(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_DELETE, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def delete(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_DELETE, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def head(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_HEAD, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def head(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_HEAD, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def options(self, path: str, *, content_type: Optional[str] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
-        return self.route(hdrs.METH_OPTIONS, path, tag=tag, secure=secure, content_type=content_type, **kwargs)
+    def options(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+        return self.route(hdrs.METH_OPTIONS, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
 
 class Router(web.RouteTableDef):
@@ -116,8 +156,8 @@ class Router(web.RouteTableDef):
         self,
         default_content_type: str = "text/html",
         default_charset: str = "utf-8",
-        on_result: Optional[Callable[[Any], Any]] = None,
-        on_error: Optional[Callable[[BaseException], Any]] = None,
+        on_result: Optional[Callable[[str, str, Any], Any]] = None,
+        on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
     ) -> None:
         super().__init__()
         self._type_injectors: dict[type, InjectorFactory] = {
@@ -158,6 +198,12 @@ class Router(web.RouteTableDef):
 
     @override
     def route(self, method: str, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+        """Register a route.
+
+        Unrecognized keyword arguments (e.g. ``name=``, ``allow_head=``) are
+        forwarded as-is to aiohttp's own route registration, matching
+        ``web.RouteTableDef``'s behaviour.
+        """
         ct = content_type or self._default_content_type
 
         def decorate(handler: T) -> T:
@@ -168,6 +214,7 @@ class Router(web.RouteTableDef):
                 router_type=RouterType.PLAIN,
                 content_type=ct,
                 charset=self._default_charset,
+                kwargs=kwargs,
             ))
             return handler
         return decorate
@@ -200,13 +247,20 @@ class Router(web.RouteTableDef):
     def options(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_OPTIONS, path, content_type=content_type, **kwargs)
 
-    def include(self, instance: object) -> None:
+    def include(self, instance: object) -> None:  # noqa: C901
         """Replace unbound class methods in _pending with bound methods from *instance*.
 
         Also accepts a module. Route-decorated free functions need no binding
-        (they aren't methods), so this instead assigns a fallback OpenAPI tag —
-        the module's ``__tag__`` if it defines one, else the last segment of its
-        ``__name__`` — to any of its API routes that don't already have one.
+        (they aren't methods), so this instead assigns fallback OpenAPI metadata
+        to any of its API routes:
+
+        - ``tag`` — the module's ``__tag__`` if it defines one, else the last
+          segment of its ``__name__`` — applied to routes that don't already
+          have one.
+        - ``responses`` — the module's ``__responses__`` dict, if it defines
+          one — merged into each route's own ``responses`` (the route's own
+          entries win on a status-code conflict).
+
         This also turns "import a routes module purely to run its decorators"
         into a real use of that import, so static analysis stops flagging it
         as unused::
@@ -216,13 +270,14 @@ class Router(web.RouteTableDef):
         """
         if inspect.ismodule(instance):
             tag = getattr(instance, "__tag__", None) or instance.__name__.rsplit(".", 1)[-1]
+            responses = getattr(instance, "__responses__", None)
             for p in self._pending:
-                if (
-                    p.tag is None
-                    and p.router_type == RouterType.API
-                    and getattr(p.handler, "__module__", None) == instance.__name__
-                ):
+                if p.router_type != RouterType.API or getattr(p.handler, "__module__", None) != instance.__name__:
+                    continue
+                if p.tag is None:
                     p.tag = tag
+                if responses:
+                    p.responses = {**responses, **(p.responses or {})}
             return
 
         tag = type(instance).__name__
@@ -249,6 +304,8 @@ class Router(web.RouteTableDef):
                     charset=p.charset,
                     tag=p.tag if p.tag is not None else (tag if p.router_type == RouterType.API else None),
                     secure=p.secure,
+                    responses=p.responses,
+                    kwargs=p.kwargs,
                 ))
 
     def build(self) -> None:
@@ -277,7 +334,7 @@ class Router(web.RouteTableDef):
 
         self._pending.clear()
 
-    def _register(self, entry: _PendingRoute) -> None:
+    def _register(self, entry: _PendingRoute) -> None:  # noqa: C901
         """Create a Provider-wrapped handler and add it to the route table."""
         handler = entry.handler
         params = list(inspect.signature(handler).parameters.values())
@@ -301,33 +358,45 @@ class Router(web.RouteTableDef):
         async def wrapped(request: web.Request) -> web.StreamResponse:
             try:
                 args = await provider.gather_args(request)
-            except TypeError as error:
-                raise web.HTTPBadRequest(text=str(error)) from error
+            except web.HTTPException as error:
+                # RequestValidationError (an ApiError, hence a web.HTTPException) already
+                # carries its own status/JSON body — just let it propagate, except plain
+                # routes keep their old plain-text 400 instead of a JSON error body.
+                if not is_api_route:
+                    raise web.HTTPBadRequest(text=str(error)) from error
+                raise
+            except Exception as error:  # noqa: BLE001 - _handle_unexpected_error re-raises for plain routes
+                return _handle_unexpected_error(
+                    error, request, on_error=on_error, is_api_route=is_api_route,
+                    provider=provider, content_type=content_type, charset=charset,
+                )
 
             try:
                 result: Any = handler(**args)
                 if inspect.isawaitable(result):
                     result = await result
             except web.HTTPException:
+                # Covers both aiohttp's own web.HTTPGone()-style exceptions and our own
+                # ApiError subclasses — both already are the response, so just propagate.
                 raise
-            except Exception as error:
-                if on_error is None:
-                    raise
-                return provider.encode_response(
-                    on_error(error), content_type=content_type, charset=charset, status=500,
+            except Exception as error:  # noqa: BLE001 - _handle_unexpected_error re-raises for plain routes
+                return _handle_unexpected_error(
+                    error, request, on_error=on_error, is_api_route=is_api_route,
+                    provider=provider, content_type=content_type, charset=charset,
                 )
 
             if on_result is not None:
-                result = on_result(result)
+                result = on_result(request.method, request.path, result)
             return provider.encode_response(result, content_type=content_type, charset=charset)
 
-        self._items.append(web.RouteDef(entry.method, entry.path, wrapped, {}))
+        self._items.append(web.RouteDef(entry.method, entry.path, wrapped, entry.kwargs))
         log.debug("%-5s %-7s %s", entry.router_type, entry.method, entry.path)
 
         if entry.router_type == RouterType.API:
             self.openapi.add_route(
                 entry.method, entry.path, entry.handler, self._type_injectors,
                 tag=entry.tag, secure=entry.secure, content_type=entry.content_type,
+                responses=entry.responses,
             )
 
     @override

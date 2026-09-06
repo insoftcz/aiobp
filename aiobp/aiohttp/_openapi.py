@@ -8,7 +8,7 @@ from typing import Annotated, Any, Optional, get_args, get_origin
 import msgspec
 from msgspec import Meta
 
-from ._provider import Provider, SourceKind
+from ._provider import ApiError, Provider, RequestValidationError, ServerError, SourceKind
 
 # Mapping from Python built-in types to OpenAPI schema types.
 _TYPE_MAP: dict[type, dict[str, str]] = {
@@ -133,8 +133,33 @@ class OpenAPIBuilder:
         if "description" in schema:
             schema["description"] = _clean_description(schema["description"])
 
+        for name, component in components.items():
+            existing = self._schemas.get(name)
+            if existing is not None and existing != component:
+                msg = (
+                    f"OpenAPI schema name collision: two different types are both named {name!r}. "
+                    f"Rename one of them so their generated JSON Schemas don't clash."
+                )
+                raise ValueError(msg)
+
         self._schemas.update(components)
         return schema
+
+    def _response_entry(self, typ: Any) -> dict[str, Any]:  # noqa: ANN401
+        """Build a full OpenAPI response object (description + schema + example) for a type.
+
+        ``typ`` may be an ``ApiError`` subclass — the response-level
+        description comes from *its own* docstring (what the error means),
+        while its ``response_type`` (the msgspec.Struct describing its body)
+        supplies the schema, so callers can pass the exception class itself
+        wherever a response type is expected.
+        """
+        summary, _ = _split_docstring(typ.__doc__)
+        if isinstance(typ, type) and issubclass(typ, ApiError):
+            typ = typ.response_type
+        schema = self._response_schema(typ)
+        media_type: dict[str, Any] = {"schema": schema, "example": self._example_for(schema)}
+        return {"description": summary or "Error", "content": {"application/json": media_type}}
 
     def _resolve_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
         """Follow a single ``$ref`` into the registered component schemas."""
@@ -165,6 +190,9 @@ class OpenAPIBuilder:
                     return self._example_for(branch)
             return None
 
+        if "enum" in schema:
+            return schema["enum"][0]
+
         schema_type = schema.get("type")
         if schema_type == "object":
             return {name: self._example_for(prop) for name, prop in schema.get("properties", {}).items()}
@@ -185,12 +213,18 @@ class OpenAPIBuilder:
         tag: Optional[str] = None,
         secure: Optional[bool] = None,
         content_type: Optional[str] = None,
+        responses: Optional[dict[int, type]] = None,
     ) -> None:
         """Register a route in the spec.
 
         secure=True  — require auth on this endpoint (even if no global security).
         secure=False — mark this endpoint as public (overrides global security).
         secure=None  — inherit global security (default).
+
+        Every route documents built-in 400 (argument validation failed) and 500
+        (unhandled exception) responses automatically, matching the router's
+        actual runtime behaviour. ``responses`` adds/overrides entries for other
+        status codes a handler can return, e.g. ``responses={404: NotFoundError}``.
         """
         openapi_path = _PATH_PARAM_RE.sub(r"{\1}", path)
         path_param_names = _path_param_names(openapi_path)
@@ -299,9 +333,12 @@ class OpenAPIBuilder:
             "parameters": parameters,
             "responses": {
                 "200": success,
-                "400": {"description": "Bad request — missing or invalid parameter"},
+                "400": self._response_entry(RequestValidationError),
+                "500": self._response_entry(ServerError),
             },
         }
+        for status, error_type in (responses or {}).items():
+            operation["responses"][str(status)] = self._response_entry(error_type)
         if request_body_schema is not None:
             operation["requestBody"] = {
                 "required": True,
@@ -325,7 +362,7 @@ class OpenAPIBuilder:
         # 3.0's Schema Object (JSON-Schema-draft-4-ish) can't represent either.
         info: dict[str, Any] = {"title": self.title, "version": self.version}
         if self.description:
-            info["description"] = self.description
+            info["description"] = _clean_description(self.description)
         spec: dict[str, Any] = {
             "openapi": "3.2.0",
             "info": info,

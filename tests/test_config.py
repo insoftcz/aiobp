@@ -1,6 +1,5 @@
 """Test config loaders"""
 
-import unittest
 from dataclasses import dataclass, field
 
 from aiobp.config.conf import loader as conf_loader
@@ -60,30 +59,31 @@ defaults = Config(
     users={},
 )
 
-class TestConfigLoaders(unittest.TestCase):
-    def test_conf_loader(self) -> None:
-        config = conf_loader(Config, "tests/config.conf")
-        assert config == expected
+def test_conf_loader() -> None:
+    config = conf_loader(Config, "tests/config.conf")
+    assert config == expected
 
-    def test_yaml_loader(self) -> None:
-        config = yaml_loader(Config, "tests/config.yaml")
-        assert config == expected
 
-    def test_json_loader(self) -> None:
-        config = json_loader(Config, "tests/config.json")
-        assert config == expected
+def test_yaml_loader() -> None:
+    config = yaml_loader(Config, "tests/config.yaml")
+    assert config == expected
 
-    def test_conf_defaults(self) -> None:
-        config = conf_loader(Config)
-        assert config == defaults
 
-    def test_json_defaults(self) -> None:
-        config = json_loader(Config)
-        assert config == defaults
+def test_json_loader() -> None:
+    config = json_loader(Config, "tests/config.json")
+    assert config == expected
 
-    def test_yaml_defaults(self) -> None:
-        config = yaml_loader(Config)
-        assert config == defaults
 
-if __name__ == "__main__":
-    unittest.main()
+def test_conf_defaults() -> None:
+    config = conf_loader(Config)
+    assert config == defaults
+
+
+def test_json_defaults() -> None:
+    config = json_loader(Config)
+    assert config == defaults
+
+
+def test_yaml_defaults() -> None:
+    config = yaml_loader(Config)
+    assert config == defaults

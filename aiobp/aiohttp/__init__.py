@@ -10,11 +10,24 @@
 
 from ._connection import ClientAddress, ServerHostname
 from ._http_range import HttpRangeRequest, http_range, range_headers
-from ._provider import BodyKey, CookieKey, FromBody, FromPath, FromQuery, HeaderKey, Param, PathKey, QueryKey
+from ._provider import (
+    ApiError,
+    BodyKey,
+    CookieKey,
+    FromBody,
+    FromPath,
+    FromQuery,
+    HeaderKey,
+    Param,
+    PathKey,
+    QueryKey,
+    ServerError,
+)
 from ._router import ApiRouter, Router, router
 from ._server import WebServer
 
 __all__ = [
+    "ApiError",
     "ApiRouter",
     "BodyKey",
     "ClientAddress",
@@ -28,6 +41,7 @@ __all__ = [
     "PathKey",
     "QueryKey",
     "Router",
+    "ServerError",
     "ServerHostname",
     "WebServer",
     "http_range",

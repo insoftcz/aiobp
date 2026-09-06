@@ -3,6 +3,23 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.4.0] - 2026-09-06
+
+### 🚀 Features
+
+- Added suppress_and_log exception context manager to logging
+- Added aiohttp router with dependency injection and Swagger
+
+### 🐛 Bug Fixes
+
+- Provide return schemas with descriptions and examples
+
+### ⚙️ Miscellaneous Tasks
+
+- More production ready aiohttp stuff
+- Improved OpenAPI documentation for return types
+
+
 ## [1.3.2] - 2026-07-14
 
 ### 🐛 Bug Fixes
