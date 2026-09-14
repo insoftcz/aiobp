@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from .exceptions import InvalidConfigFile
+from aiobp.config.exceptions import InvalidConfigFile
 
 
 def sys_argv_or_filenames(*filenames: str) -> str:

@@ -5,9 +5,9 @@ import os
 import socket
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Optional
 
-from ._otel import endpoint_reachable
+from aiobp._otel import endpoint_reachable
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def current_span():
 
 def start_span(
     name: str,
-    attrs: Optional[Dict[str, Any]] = None,
+    attrs: Optional[dict[str, Any]] = None,
     context: Optional[Any] = None,
     traceparent: Optional[str] = None,
 ):
@@ -96,11 +96,11 @@ def current_traceparent() -> str:
     return propagation_headers().get("traceparent", "")
 
 
-def propagation_headers() -> Dict[str, str]:
+def propagation_headers() -> dict[str, str]:
     """Headers dict carrying the current span context across boundaries."""
     if not _OTEL:
         return {}
-    carrier: Dict[str, str] = {}
+    carrier: dict[str, str] = {}
     inject(carrier)
     return carrier
 
@@ -108,10 +108,10 @@ def propagation_headers() -> Dict[str, str]:
 @asynccontextmanager
 async def traced(
     name: str,
-    attrs: Optional[Dict[str, Any]] = None,
+    attrs: Optional[dict[str, Any]] = None,
     context: Optional[Any] = None,
     traceparent: Optional[str] = None,
-    suppress: Tuple[Type[BaseException], ...] = (),
+    suppress: tuple[type[BaseException], ...] = (),
     errors_only: bool = False,
 ):
     """Open a span, attach attrs, stamp ERROR on exception. Suppress types listed in ``suppress``.

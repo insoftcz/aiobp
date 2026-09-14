@@ -90,7 +90,7 @@ class ValidationErrorResponse(msgspec.Struct):
     errors: list[ArgumentValidationError]
 
 
-class RequestValidationError(ApiError, TypeError):
+class RequestValidationError(ApiError):
     """Aggregates every ``ArgumentError`` raised while gathering a request's arguments."""
 
     status_code = 400

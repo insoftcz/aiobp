@@ -11,13 +11,29 @@ from aiohttp import hdrs, web
 from typing_extensions import override
 
 from aiobp import log
-
-from ._connection import ClientAddress, ServerHostname, get_client_address, get_server_hostname
-from ._http_range import HttpRangeRequest
-from ._openapi import OpenAPIBuilder
-from ._provider import InjectorFactory, Provider, ServerError
+from aiobp.aiohttp._connection import ClientAddress, ServerHostname, get_client_address, get_server_hostname
+from aiobp.aiohttp._http_range import HttpRangeRequest
+from aiobp.aiohttp._openapi import OpenAPIBuilder
+from aiobp.aiohttp._provider import InjectorFactory, Provider, ServerError
 
 T = TypeVar("T", bound=Callable[..., Awaitable[Any]])
+
+
+def _make_openapi_json_handler(spec: dict[str, Any]) -> Callable[[], Awaitable[dict[str, Any]]]:
+    """Bind ``spec`` in its own scope — a plain closure over a ``_mount_docs()`` loop variable
+
+    would have every mounted route serve whichever ApiRouter's spec was built last.
+    """
+    async def openapi_json() -> dict[str, Any]:
+        return spec
+    return openapi_json
+
+
+def _make_swagger_ui_handler(html: str) -> Callable[[], Awaitable[str]]:
+    """See ``_make_openapi_json_handler`` — same loop-variable-capture reason."""
+    async def swagger_ui() -> str:
+        return html
+    return swagger_ui
 
 
 def _handle_unexpected_error(  # noqa: PLR0913
@@ -73,25 +89,63 @@ class _PendingRoute:
     secure: Optional[bool] = None
     responses: Optional[dict[int, type]] = None
     kwargs: dict[str, Any] = field(default_factory=dict)
+    api_router: Optional["ApiRouter"] = None
 
 
 class ApiRouter:
-    """Decorator factory for routes included in OpenAPI/Swagger docs."""
+    """Decorator factory for routes included in OpenAPI/Swagger docs.
 
-    def __init__(
+    Attach it to a ``Router`` by constructing it with that router's own
+    pending list — it then shares registration with the router, and gets its
+    own ``/docs``/``openapi.json`` mounted under ``prefix``, independent of
+    any other ``ApiRouter`` assigned to the same ``Router``. This is how
+    you'd run e.g. two separately-documented API versions off one ``Router``,
+    typically by subclassing it::
+
+        class MyRouter(Router):
+            def __init__(self) -> None:
+                super().__init__()
+                self.api_v1 = ApiRouter("/api/v1.0", self._pending)
+                self.api_v2 = ApiRouter("/api/v2.0", self._pending)
+
+    A path starting with ``/`` is absolute and bypasses ``prefix`` entirely;
+    any other path is joined onto it::
+
+        api = ApiRouter("/api/v1.0", pending)
+
+        @api.get("call")           # -> GET /api/v1.0/call
+        async def call() -> ...: ...
+
+        @api.get("/scim/Users")    # -> GET /scim/Users (prefix ignored)
+        async def scim_users() -> ...: ...
+    """
+
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
-        pending: list[_PendingRoute],
+        prefix: str = "/",
+        pending: Optional[list[_PendingRoute]] = None,
         default_content_type: str = "application/json",
         default_charset: str = "utf-8",
         on_result: Optional[Callable[[str, str, Any], Any]] = None,
         on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
     ) -> None:
-        self._pending: list[_PendingRoute] = pending
+        if not prefix.startswith("/"):
+            msg = f"ApiRouter prefix must start with '/', got {prefix!r}"
+            raise ValueError(msg)
+        self.prefix: str = prefix
+        self._pending: list[_PendingRoute] = pending if pending is not None else []
         self._router_type: RouterType = RouterType.API
         self._default_content_type: str = default_content_type
         self._default_charset: str = default_charset
         self.on_result: Optional[Callable[[str, str, Any], Any]] = on_result
         self.on_error: Optional[Callable[[str, str, BaseException], Any]] = on_error
+        self.docs: OpenAPIBuilder = OpenAPIBuilder()
+
+    def _full_path(self, path: str) -> str:
+        """Resolve a decorated path against ``prefix``; an absolute path bypasses it."""
+        if path.startswith("/"):
+            return path
+        return f"{self.prefix.rstrip('/')}/{path}"
 
     def route(  # noqa: PLR0913
         self,
@@ -116,13 +170,14 @@ class ApiRouter:
             self._pending.append(_PendingRoute(
                 handler=handler,
                 method=method,
-                path=path,
+                path=self._full_path(path),
                 router_type=self._router_type,
                 content_type=ct,
                 charset=self._default_charset,
                 tag=tag, secure=secure,
                 responses=responses,
                 kwargs=kwargs,
+                api_router=self,
             ))
             return handler
         return decorate
@@ -150,14 +205,18 @@ class ApiRouter:
 
 
 class Router(web.RouteTableDef):
-    """Coordinates API and plain sub-routers sharing the same pending list."""
+    """Coordinates any number of ``ApiRouter``s and plain routes sharing one pending list.
+
+    Comes with no ``ApiRouter`` of its own. Attach one (or several) by
+    constructing it with this router's own ``_pending`` list, typically in a
+    subclass — see ``ApiRouter``'s docstring. Use ``BuiltinRouter`` instead
+    for the common case of a single default ``api`` ApiRouter created for you.
+    """
 
     def __init__(
         self,
         default_content_type: str = "text/html",
         default_charset: str = "utf-8",
-        on_result: Optional[Callable[[str, str, Any], Any]] = None,
-        on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
     ) -> None:
         super().__init__()
         self._type_injectors: dict[type, InjectorFactory] = {
@@ -170,31 +229,32 @@ class Router(web.RouteTableDef):
         self._built: bool = False
         self._default_content_type: str = default_content_type
         self._default_charset: str = default_charset
-        self.openapi: OpenAPIBuilder = OpenAPIBuilder()
-        self.api: ApiRouter = ApiRouter(self._pending, on_result=on_result, on_error=on_error)
 
     def add_type_injector(self, typ: type, factory: InjectorFactory) -> None:
         self._type_injectors[typ] = factory
 
+    def _api_routers(self) -> list[ApiRouter]:
+        """Every ``ApiRouter`` attached to this router, e.g. ``self.api``/``self.api_v2``."""
+        seen: list[ApiRouter] = []
+        for value in vars(self).values():
+            if isinstance(value, ApiRouter) and value not in seen:
+                seen.append(value)
+        return seen
+
     def _mount_docs(self) -> None:
-        """Serve OpenAPI JSON spec and Swagger UI."""
-        if self.openapi.prefix is None:
-            log.debug("Not mounting OpenAPI docs, router.openapi.prefix is None")
-            return
+        """Serve each ApiRouter's OpenAPI JSON spec and Swagger UI, under its own prefix."""
+        for api_router in self._api_routers():
+            docs = api_router.docs
+            base = api_router.prefix.rstrip("/")
 
-        url = f"{self.openapi.prefix}/openapi.json"
-        spec = self.openapi.build()
-        docs = self.openapi.swagger_ui_html(url)
+            url = f"{base}/openapi.json"
+            spec = docs.build()
+            html = docs.swagger_ui_html(url)
 
-        @self.get(url, content_type="application/json")
-        async def openapi_json() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-            return spec
+            self.get(url, content_type="application/json")(_make_openapi_json_handler(spec))
+            self.get(f"{base}/docs")(_make_swagger_ui_handler(html))
 
-        @self.get(f"{self.openapi.prefix}/docs")
-        async def swagger_ui() -> str:  # pyright: ignore[reportUnusedFunction]
-            return docs
-
-        log.info("API docs available at %s/docs", self.openapi.prefix)
+            log.info("API docs available at %s/docs", base)
 
     @override
     def route(self, method: str, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
@@ -306,6 +366,7 @@ class Router(web.RouteTableDef):
                     secure=p.secure,
                     responses=p.responses,
                     kwargs=p.kwargs,
+                    api_router=p.api_router,
                 ))
 
     def build(self) -> None:
@@ -346,12 +407,12 @@ class Router(web.RouteTableDef):
             raise TypeError(msg)
         content_type = entry.content_type
         charset = entry.charset
-        # Read live off self.api (not snapshotted at decoration time) so that setting
-        # router.api.on_result/on_error after routes are decorated still takes effect —
+        # Read live off entry.api_router (not snapshotted at decoration time) so that
+        # setting its on_result/on_error after routes are decorated still takes effect —
         # this runs once, lazily, at build() time.
-        is_api_route = entry.router_type == RouterType.API
-        on_result = self.api.on_result if is_api_route else None
-        on_error = self.api.on_error if is_api_route else None
+        is_api_route = entry.api_router is not None
+        on_result = entry.api_router.on_result if entry.api_router is not None else None
+        on_error = entry.api_router.on_error if entry.api_router is not None else None
         provider = Provider(handler, self._type_injectors)
 
         @wraps(entry.handler)
@@ -392,8 +453,8 @@ class Router(web.RouteTableDef):
         self._items.append(web.RouteDef(entry.method, entry.path, wrapped, entry.kwargs))
         log.debug("%-5s %-7s %s", entry.router_type, entry.method, entry.path)
 
-        if entry.router_type == RouterType.API:
-            self.openapi.add_route(
+        if entry.api_router is not None:
+            entry.api_router.docs.add_route(
                 entry.method, entry.path, entry.handler, self._type_injectors,
                 tag=entry.tag, secure=entry.secure, content_type=entry.content_type,
                 responses=entry.responses,
@@ -405,8 +466,28 @@ class Router(web.RouteTableDef):
         return iter(self._items)
 
 
+class BuiltinRouter(Router):
+    """A ``Router`` with a default ``api`` ``ApiRouter`` already attached.
+
+    This is what the package's default ``router`` singleton uses — the
+    common case of a single documented API surface plus plain routes.
+    Additional ``ApiRouter``s (e.g. a versioned ``api_v2``) can still be
+    attached the same way as on a bare ``Router``.
+    """
+
+    def __init__(
+        self,
+        default_content_type: str = "text/html",
+        default_charset: str = "utf-8",
+        on_result: Optional[Callable[[str, str, Any], Any]] = None,
+        on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
+    ) -> None:
+        super().__init__(default_content_type=default_content_type, default_charset=default_charset)
+        self.api: ApiRouter = ApiRouter(pending=self._pending, on_result=on_result, on_error=on_error)
+
+
 # Default router singleton
-router = Router()
+router = BuiltinRouter()
 
 # Module-level aliases for plain routes
 get = router.get

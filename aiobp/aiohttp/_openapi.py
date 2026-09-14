@@ -8,7 +8,7 @@ from typing import Annotated, Any, Optional, get_args, get_origin
 import msgspec
 from msgspec import Meta
 
-from ._provider import ApiError, Provider, RequestValidationError, ServerError, SourceKind
+from aiobp.aiohttp._provider import ApiError, Provider, RequestValidationError, ServerError, SourceKind
 
 # Mapping from Python built-in types to OpenAPI schema types.
 _TYPE_MAP: dict[type, dict[str, str]] = {
@@ -78,7 +78,6 @@ class OpenAPIBuilder:
     """Accumulates route metadata and produces an OpenAPI 3.0 document."""
 
     def __init__(self) -> None:
-        self.prefix: Optional[str] = ""  # where to mount /docs (don't automount them when None)
         self.title: str = "API"
         self.version: str = "0.0.0"
         self.description: Optional[str] = None

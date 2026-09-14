@@ -6,8 +6,7 @@ from aiohttp import web
 from aiohttp.web_routedef import RouteTableDef
 
 from aiobp import log, on_shutdown
-
-from ._router import router
+from aiobp.aiohttp._router import router
 
 
 class WebServer:

@@ -18,7 +18,9 @@ from yarl import URL
 
 from aiobp.aiohttp import (
     ApiError,
+    ApiRouter,
     BodyKey,
+    BuiltinRouter,
     ClientAddress,
     CookieKey,
     FromBody,
@@ -226,7 +228,7 @@ class TestProviderGatherArgs:
         async def handler(who: Annotated[str, Meta(description="name")]) -> str: ...
         provider = self._make_provider(handler)
         request = make_request()
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_missing_required_raises_structured_error_with_source(self) -> None:
@@ -304,7 +306,7 @@ class TestProviderGatherArgs:
         async def handler(who: Annotated[str, Meta(description="name"), PathKey]) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(query={"who": "from_query"})
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_path_source_resolves_from_path(self) -> None:
@@ -318,7 +320,7 @@ class TestProviderGatherArgs:
         async def handler(who: Annotated[str, Meta(description="name"), QueryKey]) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(match_info={"who": "from_path"})
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_query_source_resolves_from_query(self) -> None:
@@ -621,7 +623,7 @@ class TestProviderGatherArgs:
             content_type="application/x-www-form-urlencoded",
             post_data={"count": "42"},
         )
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_multiple_body_args_decode_independently(self) -> None:
@@ -677,7 +679,7 @@ class TestProviderGatherArgs:
         async def handler(name: Annotated[str, Meta(description="name"), BodyKey]) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(content_type="application/json", body=msgspec.json.encode({}))
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_body_key_optional_missing_returns_default(self) -> None:
@@ -714,7 +716,7 @@ class TestProviderGatherArgs:
         async def handler(who: PathKey[str, Param("name", min_length=5)]) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(match_info={"who": "abc"})
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_param_constraint_passes(self) -> None:
@@ -728,7 +730,7 @@ class TestProviderGatherArgs:
         async def handler(age: QueryKey[int, Param("age", ge=18)]) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(query={"age": "15"})
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
         request = make_request(query={"age": "21"})
@@ -742,7 +744,7 @@ class TestProviderGatherArgs:
             content_type="application/json",
             body=b"",
         )
-        with pytest.raises(TypeError):
+        with pytest.raises(RequestValidationError):
             await provider.gather_args(request)
 
     async def test_body_optional_empty_json_returns_default(self) -> None:
@@ -1201,7 +1203,7 @@ class TestHttpRangeRequestStream:
 
 def build_app() -> aioweb.Application:
     """Create a fresh app with its own router for each test."""
-    router = Router()
+    router = BuiltinRouter()
 
     @router.api.get("/hello/{who}")
     async def hello(who: Annotated[str, Meta(description="name")]) -> str:
@@ -1343,7 +1345,7 @@ class _NotFoundError(ApiError):
 
 def build_app_with_output_handlers() -> aioweb.Application:
     """Create an app whose ApiRouter wraps successes/errors in an envelope."""
-    router = Router(
+    router = BuiltinRouter(
         on_result=lambda method, path, value: {"method": method, "path": path, "data": value},
         on_error=lambda method, path, error: {"method": method, "path": path, "error": str(error)},
     )
@@ -1400,7 +1402,7 @@ class TestApiRouterOutputHandlers:
 
 def build_app_with_late_bound_output_handler() -> aioweb.Application:
     """Set router.api.on_result after the route is decorated but before build() runs."""
-    router = Router()
+    router = BuiltinRouter()
 
     @router.api.get("/greet")
     async def greet(who: Annotated[str, Meta(description="name")]) -> str:
@@ -1427,7 +1429,7 @@ class TestApiRouterOutputHandlerSetAfterDecoration:
 
 def build_app_with_builtin_error_responses() -> aioweb.Application:
     """Create an app relying on the router's built-in structured 400/500 (no on_error/on_result)."""
-    router = Router()
+    router = BuiltinRouter()
 
     @router.api.get("/greet")
     async def greet(who: Annotated[str, Meta(description="name"), QueryKey]) -> str:
@@ -1509,7 +1511,7 @@ class TestBuiltinErrorResponses:
 class TestDuplicateRoute:
 
     def test_duplicate_api_route_raises(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/items")
         async def list_items(request: aioweb.Request) -> None: ...
@@ -1533,7 +1535,7 @@ class TestDuplicateRoute:
             router.build()
 
     def test_duplicate_across_api_and_plain_raises(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/shared")
         async def api_handler(request: aioweb.Request) -> None: ...
@@ -1545,7 +1547,7 @@ class TestDuplicateRoute:
             router.build()
 
     def test_same_path_different_methods_allowed(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/items")
         async def list_items(request: aioweb.Request) -> None: ...
@@ -1556,7 +1558,7 @@ class TestDuplicateRoute:
         router.build()  # should not raise
 
     def test_duplicate_via_include_raises(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         class A:
             @router.api.get("/hello")
@@ -1580,7 +1582,7 @@ class TestDuplicateRoute:
 class TestPendingRoutes:
 
     def test_api_get_stores_metadata(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get('/items/{id}', tag='Items')
         async def get_item() -> None: ...
@@ -1605,7 +1607,7 @@ class TestPendingRoutes:
         assert entry.router_type == 'plain'
 
     def test_multiple_decorators_on_same_handler(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get('/items')
         @router.api.get('/all-items')
@@ -1615,7 +1617,7 @@ class TestPendingRoutes:
 
     def test_api_get_forwards_unrecognized_kwargs(self) -> None:
         """Unknown kwargs (e.g. aiohttp's own name=) are stored, not silently dropped."""
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get('/items/{id}', name='get_item')
         async def get_item() -> None: ...
@@ -1632,7 +1634,7 @@ class TestPendingRoutes:
 
     def test_forwarded_kwargs_reach_aiohttps_own_route_registration(self) -> None:
         """name= isn't just stored — it actually reaches aiohttp's UrlDispatcher."""
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get('/items/{id}', name='get_item')
         async def get_item(id: PathKey[str, 'id']) -> str:
@@ -1650,7 +1652,7 @@ class TestPendingRoutes:
 class TestUnboundSelfDetection:
 
     def test_missing_include_raises(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         class Greeter:
             @router.api.get('/greet')
@@ -1665,7 +1667,7 @@ class TestIncludeModule:
     """router.include() also accepts a module: a real use of the import, plus auto-tagging."""
 
     def test_include_module_is_a_noop_for_unrelated_module(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/greet")
         async def greet() -> str:
@@ -1689,7 +1691,7 @@ class TestIncludeModule:
         assert len(router._pending) == 1
 
     def test_include_module_tags_untagged_api_routes_with_last_name_segment(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/greet")
         async def greet() -> str:
@@ -1700,7 +1702,7 @@ class TestIncludeModule:
         assert router._pending[0].tag == __name__.rsplit(".", 1)[-1]
 
     def test_include_module_dunder_tag_overrides_default(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/greet")
         async def greet() -> str:
@@ -1712,7 +1714,7 @@ class TestIncludeModule:
         assert router._pending[0].tag == "CustomTag"
 
     def test_include_module_does_not_override_explicit_tag(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/greet", tag="Explicit")
         async def greet() -> str:
@@ -1734,7 +1736,7 @@ class TestIncludeModule:
         assert router._pending[0].tag is None
 
     def test_include_module_dunder_responses_applied_when_unset(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         @router.api.get("/greet")
         async def greet() -> str:
@@ -1749,7 +1751,7 @@ class TestIncludeModule:
         assert router._pending[0].responses == {404: NotFoundError}
 
     def test_include_module_dunder_responses_merges_with_explicit_responses(self) -> None:
-        router = Router()
+        router = BuiltinRouter()
 
         class NotFoundError(msgspec.Struct):
             detail: str
@@ -1788,7 +1790,7 @@ class TestIncludeModule:
 
 def build_app_with_include() -> aioweb.Application:
     """Create an app whose routes are registered via router.include()."""
-    router = Router()
+    router = BuiltinRouter()
 
     class Greeter:
         @router.api.get('/greet/{who}')
@@ -1845,7 +1847,7 @@ class TestRouterInclude:
 
     async def test_include_with_type_injector(self) -> None:
         """Verify that type injectors work with include()."""
-        router = Router()
+        router = BuiltinRouter()
 
         class MyService:
             value = 42
@@ -1871,6 +1873,152 @@ class TestRouterInclude:
             assert await resp.json() == '42'
         finally:
             await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Multiple ApiRouters on one Router
+# ---------------------------------------------------------------------------
+
+class TestApiRouterPrefix:
+
+    def test_default_prefix_is_root(self) -> None:
+        assert ApiRouter().prefix == "/"
+
+    def test_rejects_prefix_without_leading_slash(self) -> None:
+        with pytest.raises(ValueError, match="must start with '/'"):
+            ApiRouter("api/v1.0")
+
+    def test_relative_path_is_joined_onto_prefix(self) -> None:
+        api = ApiRouter("/api/v1.0")
+
+        @api.get("call")
+        async def call() -> str:
+            return "ok"
+
+        assert api._pending[-1].path == "/api/v1.0/call"
+
+    def test_absolute_path_bypasses_prefix(self) -> None:
+        api = ApiRouter("/api/v1.0")
+
+        @api.get("/scim/Users")
+        async def scim_users() -> str:
+            return "ok"
+
+        assert api._pending[-1].path == "/scim/Users"
+
+    def test_default_prefix_still_joins_relative_paths(self) -> None:
+        api = ApiRouter()
+
+        @api.get("call")
+        async def call() -> str:
+            return "ok"
+
+        assert api._pending[-1].path == "/call"
+
+    def test_trailing_slash_in_prefix_does_not_double_up(self) -> None:
+        api = ApiRouter("/api/v1.0/")
+
+        @api.get("call")
+        async def call() -> str:
+            return "ok"
+
+        assert api._pending[-1].path == "/api/v1.0/call"
+
+
+class TestMultipleApiRouters:
+
+    def test_constructing_with_shared_pending_registers_its_routes(self) -> None:
+        router = Router()
+        api_v2 = ApiRouter(pending=router._pending)
+
+        @api_v2.get("/v2/items")
+        async def list_items_v2() -> str:
+            return "v2"
+
+        assert router._pending[-1].handler is list_items_v2
+        assert router._pending[-1].api_router is api_v2
+
+    async def test_each_api_router_gets_its_own_docs_at_its_own_prefix(self, aiohttp_client) -> None:
+        router = BuiltinRouter()
+
+        @router.api.get("/items")
+        async def list_items_v1() -> str:
+            return "v1"
+
+        router.api_v2 = ApiRouter("/api/v2.0", router._pending)
+
+        @router.api_v2.get("items")
+        async def list_items_v2() -> str:
+            return "v2"
+
+        app = aioweb.Application()
+        app.add_routes(router)
+        client = await aiohttp_client(app)
+
+        v1_spec = await (await client.get("/openapi.json")).json()
+        assert list(v1_spec["paths"]) == ["/items"]
+
+        v2_spec = await (await client.get("/api/v2.0/openapi.json")).json()
+        assert list(v2_spec["paths"]) == ["/api/v2.0/items"]
+
+        assert (await client.get("/api/v2.0/docs")).status == 200
+
+    async def test_on_result_is_scoped_per_api_router(self, aiohttp_client) -> None:
+        router = BuiltinRouter(on_result=lambda method, path, value: {"v1": value})
+
+        @router.api.get("/x")
+        async def x() -> str:
+            return "x"
+
+        router.api_v2 = ApiRouter(
+            "/api/v2.0", router._pending, on_result=lambda method, path, value: {"v2": value},
+        )
+
+        @router.api_v2.get("y")
+        async def y() -> str:
+            return "y"
+
+        app = aioweb.Application()
+        app.add_routes(router)
+        client = await aiohttp_client(app)
+
+        assert await (await client.get("/x")).json() == {"v1": "x"}
+        assert await (await client.get("/api/v2.0/y")).json() == {"v2": "y"}
+
+    def test_colliding_docs_prefixes_across_api_routers_raise(self) -> None:
+        """Two ApiRouters left at the default prefix would mount the same /docs path."""
+        router = BuiltinRouter()
+
+        @router.api.get("/x")
+        async def x() -> str:
+            return "x"
+
+        router.api_v2 = ApiRouter(pending=router._pending)
+
+        @router.api_v2.get("/y")
+        async def y() -> str:
+            return "y"
+
+        with pytest.raises(ValueError, match="Duplicate route: GET /openapi"):
+            router.build()
+
+    def test_docs_mounted_once_even_if_same_api_router_has_two_attribute_names(self) -> None:
+        router = BuiltinRouter()
+        router.also_api = router.api
+
+        @router.api.get("/x")
+        async def x() -> str:
+            return "x"
+
+        router.build()  # would raise "Duplicate route: GET /docs" if not deduplicated
+
+    def test_bare_router_has_no_default_api(self) -> None:
+        router = Router()
+        assert not hasattr(router, "api")
+
+    def test_builtin_router_has_a_default_api(self) -> None:
+        router = BuiltinRouter()
+        assert isinstance(router.api, ApiRouter)
 
 
 # ---------------------------------------------------------------------------

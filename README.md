@@ -41,7 +41,7 @@ async def main():
     except asyncio.CancelledError:
         print('Saving data...')
 
-runner(main())
+runner("Basic example", "0.0.0", main())
 ```
 
 OpenTelemetry Logging
@@ -195,9 +195,11 @@ pip install aiobp[aiohttp]
 from typing import Annotated
 from msgspec import Meta
 from aiobp import runner
-from aiobp.aiohttp import Router, WebServer
+from aiobp.aiohttp import BuiltinRouter, WebServer
 
-router = Router(title="My API", version="1.0.0")
+router = BuiltinRouter()
+router.api.docs.title = "My API"
+router.api.docs.version = "1.0.0"
 
 @router.api.get("/hello/{who}", tag="Greetings")
 async def hello(who: Annotated[str, Meta(description="Name to greet")]) -> Annotated[str, Meta(description="Greeting")]:
@@ -208,7 +210,7 @@ async def main():
     server = WebServer(8888, router=router)
     await server.start()
 
-runner(main())
+runner("Quick start", "0.0.0", main())
 ```
 
 Open `http://localhost:8888/docs` for the interactive Swagger UI.
@@ -321,7 +323,7 @@ async def stream_audio(id: Annotated[str, Meta(description="Track ID")]) -> byte
 For larger applications you can group related endpoints in a class using the same `router.api` and `router.get()` / `router.post()` decorators, then mount them with `Router.include()`:
 
 ```python
-router = Router()
+router = BuiltinRouter()
 
 class ItemRoutes:
     @router.api.get("/items/{item_id}", tag="Items")
@@ -343,7 +345,7 @@ class ItemRoutes:
 router.include(ItemRoutes())
 ```
 
-> **Note:** The `Router` must be created **before** the class definition so the decorators can reference it.
+> **Note:** The router instance must be created **before** the class definition so the decorators can reference it.
 
 `include()` automatically sets the OpenAPI tag to the class name (e.g. `ItemRoutes`) for all API routes that don't already specify a `tag=...` in the decorator.
 
@@ -355,7 +357,7 @@ This registers:
 | POST | `/items` | api |
 | GET | `/items/page` | plain |
 
-Decorator paths are always the full path — there is no prefix manipulation.
+`include()` never adds a prefix based on the class name — decorator paths are resolved exactly as written (see "Multiple documented API versions" below for the one place a prefix does apply: `ApiRouter`'s own).
 
 Duplicate routes (same HTTP method + path) raise `ValueError` at registration time, whether they come from decorators or `include()`.
 
@@ -391,10 +393,10 @@ The built-in `web.Request` injector is always registered — declare `request: w
 
 ### Authentication & Swagger
 
-Call `router.openapi.add_bearer_auth()` to add a Bearer token scheme to the Swagger UI. Mark individual endpoints with `secure=False` to make them publicly accessible:
+Call `router.api.docs.add_bearer_auth()` to add a Bearer token scheme to the Swagger UI. Mark individual endpoints with `secure=False` to make them publicly accessible:
 
 ```python
-router.openapi.add_bearer_auth()  # all endpoints require auth by default
+router.api.docs.add_bearer_auth()  # all endpoints require auth by default
 
 @router.api.post("/auth/token", tag="Auth", secure=False)  # public
 async def obtain_token(
@@ -411,8 +413,34 @@ async def me(user: User) -> Annotated[str, Meta(description="User info")]:
 For OAuth2 with a token endpoint:
 
 ```python
-router.openapi.add_oauth2("/auth/token", scopes={"read": "Read access", "write": "Write access"})
+router.api.docs.add_oauth2("/auth/token", scopes={"read": "Read access", "write": "Write access"})
 ```
+
+### `Router` vs `BuiltinRouter`
+
+`Router` is a clean base with no `ApiRouter` of its own. `BuiltinRouter` is a `Router` with a default `api` `ApiRouter` already created for you; the package's default `router` singleton and every example above use it.
+
+### Multiple documented API versions
+
+`ApiRouter`'s first argument is a path prefix (default `"/"`) — construct it with the `Router`'s own `_pending` list to attach it: it then shares registration with the router, and gets its own `/docs`/`openapi.json` mounted under that same prefix, completely separate from any other `ApiRouter` on the same router. A relative path (no leading `/`) is joined onto the prefix; an absolute path (leading `/`) bypasses it entirely. Since routes are split across modules in any real project, do this in a small `Router` subclass so every attached `ApiRouter` is visible to type checkers wherever the router is imported:
+
+```python
+class MyRouter(Router):
+    def __init__(self) -> None:
+        super().__init__()
+        self.api_v1 = ApiRouter("/api/v1.0", self._pending)
+        self.api_v2 = ApiRouter("/api/v2.0", self._pending)
+
+router = MyRouter()
+
+@router.api_v2.get("items")        # -> GET /api/v2.0/items
+async def list_items_v2() -> ...: ...
+
+@router.api_v2.get("/scim/Users")  # -> GET /scim/Users (prefix bypassed)
+async def scim_users() -> ...: ...
+```
+
+Each `ApiRouter` also has its own `on_result`/`on_error`, so different API versions (or a public vs. an internal API) can use different response envelopes.
 
 ### WebServer options
 
@@ -421,7 +449,6 @@ WebServer(
     port=8888,
     host="127.0.0.1",  # default
     router=router,     # your Router instance
-    docs=True,         # serve /docs and /openapi.json (default)
 )
 ```
 
@@ -448,10 +475,12 @@ from aiohttp import web
 from msgspec import Meta
 
 from aiobp import runner
-from aiobp.aiohttp import Router, WebServer
+from aiobp.aiohttp import BuiltinRouter, WebServer
 
-router = Router(title="My Service", version="1.0.0")
-router.openapi.add_bearer_auth()  # protect all REST endpoints by default
+router = BuiltinRouter()
+router.api.docs.title = "My Service"
+router.api.docs.version = "1.0.0"
+router.api.docs.add_bearer_auth()  # protect all REST endpoints by default
 
 
 # --- Auth model & token store ---
@@ -535,7 +564,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    runner(main())
+    runner("More complex example", "0.0.0", main())
 ```
 
 Get a token and call a protected endpoint:
