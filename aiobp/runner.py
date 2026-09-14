@@ -8,8 +8,8 @@ from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
-from .logging import log
-from .task import create_task
+from aiobp.logging import log
+from aiobp.task import create_task
 
 __on_shutdown: list[tuple[Callable[..., Coroutine], list[Any], bool]] = []  # to gracefully close connections
 
@@ -59,12 +59,33 @@ def log_awaitable(awaitable: Union[asyncio.Task, Coroutine]) -> str:
 
 
 # Needed up to Python 3.10, when we upgrade to Python 3.11 we can use builtin asyncio.run()
-def runner(service: Coroutine, shutdown_timeout: float = 5.0, *, endless: bool = True) -> None:
+def runner(
+    service_name: str,
+    service_version: str,
+    service: Coroutine,
+    *,
+    shutdown_timeout: float = 5.0,
+    endless: bool = True,
+) -> None:
     """Run given service in asyncio.Task and handle SIGTERM/KeyboardInterrupt
 
-    If endless is set to False then runner shutdown immediately after srvice
-    coroutine finishes; otherwise the service is kept running.
+    Yes, `service_name` and `service_version` arguments are here just for logging,
+    because people forget to add version and then it is hell to debug system
+    when one is unsure about running version.
+
+    If endless is False, the runner also shuts down as soon as the service
+    coroutine finishes on its own; SIGTERM/Ctrl+C still work either way, we
+    didn't remove the kill switch. If endless is True (default), the service
+    is expected to run forever and only stops on a signal.
+
+    shutdown_timeout is the total time (in seconds) graceful shutdown gets to
+    run every on_shutdown() callback and let remaining tasks finish before it
+    gives up and logs a warning instead of waiting forever.
+
+    Whatever `service` raises won't crash this function: it's caught, logged
+    as critical, and graceful shutdown proceeds anyway.
     """
+    log.info("Starting service %s %s", service_name, service_version)
     loop = asyncio.get_event_loop()
     # main does:
     # 1. start given service coroutine as task
@@ -79,6 +100,7 @@ def runner(service: Coroutine, shutdown_timeout: float = 5.0, *, endless: bool =
     # 2. cancel all tasks in parallel (via gather)
     # 3. await tasks to finish in specified shutdown_timeout
     # 4. calls all registered coroutines via on_shutdown(..., after_tasks_cancel=True) in LIFO order
+    log.info("Shutting down service %s %s", service_name, service_version)
     loop.run_until_complete(__graceful_shutdown(shutdown_timeout))
 
 
