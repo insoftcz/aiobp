@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 
 
+## [2.0.0] - 2026-09-14
+
+### 🚀 Features
+
+- [**breaking**] Require service name and version in runner
+- [**breaking**] Allow multiple API instances for version support in aiohttp
+
+
 ## [1.4.0] - 2026-09-06
 
 ### 🚀 Features

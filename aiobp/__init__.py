@@ -1,4 +1,4 @@
-__version__ = "1.4.0"
+__version__ = "2.0.0"
 
 from aiobp.logging import log
 from aiobp.runner import on_shutdown, runner
