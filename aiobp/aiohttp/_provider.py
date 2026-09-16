@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Optional, Union, fin
 
 import msgspec
 from aiohttp import web
+from aiohttp.typedefs import LooseHeaders
 from msgspec import Meta
 from typing_extensions import is_typeddict, override
 
@@ -46,18 +47,59 @@ class ApiError(web.HTTPException):
     directly with the right status code and a JSON body built from
     ``to_response()``, with no router-level special-casing required, exactly
     like raising a plain ``web.HTTPNotFound()`` already works.
+
+    For the common case, arguments passed to the constructor — positional or
+    keyword, exactly like constructing ``response_type`` directly — are
+    forwarded straight to it, so no ``to_response()`` override is needed at
+    all::
+
+        class OAuthTokenErrorResponse(Struct):
+            error: str
+            error_description: str
+            error_uri: str = "https://www.oauth.com/oauth2-servers/access-tokens"
+
+        class OAuthTokenError(ApiError):
+            response_type = OAuthTokenErrorResponse
+
+        class OAuthTokenUnauthorizedError(OAuthTokenError):
+            status_code = 401
+
+        raise OAuthTokenUnauthorizedError("invalid_client", error_description="Bad credentials")
+
+    Override ``to_response()`` instead when the body has to be computed from
+    other exception state (see ``RequestValidationError``/``ServerError``).
     """
 
     response_type: ClassVar[type[msgspec.Struct]]
 
-    def __init__(self, message: str = "") -> None:
+    def __init__(
+        self,
+        *args: Any,
+        headers: Optional[LooseHeaders] = None,
+        reason: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        # headers/reason are pulled out by name so they route to HTTPException (below)
+        # instead of into **kwargs, which is reserved for response_type's own fields —
+        # otherwise a caller passing headers=... here would silently end up trying to
+        # set a "headers" field on response_type instead of an actual HTTP header.
+        self._response_args: tuple[Any, ...] = args
+        self._response_kwargs: dict[str, Any] = kwargs
         text = msgspec.json.encode(self.to_response()).decode()
-        super().__init__(text=text, content_type="application/json")
-        self.args = (message or self.reason,)
+        super().__init__(text=text, content_type="application/json", headers=headers, reason=reason)
+        # self.reason is set by the super().__init__() call above — aiohttp derives it from
+        # status_code via the stdlib http.HTTPStatus reason phrases (e.g. 401 -> "Unauthorized"),
+        # unless the reason= argument above overrode it.
+        self.args = args or (self.reason,)
 
     def to_response(self) -> msgspec.Struct:
-        """Build the ``response_type`` instance describing this error."""
-        raise NotImplementedError
+        """Build the ``response_type`` instance describing this error.
+
+        Default: build it from the constructor's own arguments, positional
+        and keyword alike. Override this when the response can't be built
+        from those arguments alone.
+        """
+        return self.response_type(*self._response_args, **self._response_kwargs)
 
 
 class ArgumentError(TypeError):
