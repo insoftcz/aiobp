@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import signal
+import sys
 import time
 from collections.abc import Coroutine
 from pathlib import Path
@@ -85,7 +86,7 @@ def runner(
     Whatever `service` raises won't crash this function: it's caught, logged
     as critical, and graceful shutdown proceeds anyway.
     """
-    log.info("Starting service %s %s", service_name, service_version)
+    log.info("Starting service %s %s on Python %s", service_name, service_version, sys.version.replace("\n", ""))
     loop = asyncio.get_event_loop()
     # main does:
     # 1. start given service coroutine as task
