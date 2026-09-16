@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [2.1.0] - 2026-09-16
+
+### 🚀 Features
+
+- ApiError inherited exceptions can be defined and raised more simply
+
+### ⚙️ Miscellaneous Tasks
+
+- Log Python version on startup too
+
+
 ## [2.0.0] - 2026-09-14
 
 ### 🚀 Features
