@@ -33,6 +33,8 @@ from aiobp.aiohttp import (
     QueryKey,
     Router,
     ServerHostname,
+    content_disposition,
+    file_headers,
     http_range,
     range_headers,
 )
@@ -934,6 +936,73 @@ class TestHttpRangeHelpers:
     def test_range_headers_clamps_end(self) -> None:
         headers = range_headers((10, 999), total_length=20)
         assert headers["Content-Range"] == "bytes 10-19/20"
+
+
+class TestContentDisposition:
+
+    def test_safe_filename_has_no_extended_fallback(self) -> None:
+        header = content_disposition("attachment", "report.pdf")
+        assert header == 'attachment; filename="report.pdf"'
+
+    def test_inline_disposition(self) -> None:
+        header = content_disposition("inline", "report.pdf")
+        assert header.startswith("inline;")
+
+    def test_crlf_is_stripped_from_fallback_and_kept_in_extended_value(self) -> None:
+        header = content_disposition("attachment", "evil\r\nSet-Cookie: pwned=1")
+        assert 'filename="evil Set-Cookie: pwned=1"' in header
+        assert "\r" not in header.split("filename*=UTF-8''")[0]
+        assert "\n" not in header.split("filename*=UTF-8''")[0]
+        assert "filename*=UTF-8''evil%0D%0ASet-Cookie%3A%20pwned%3D1" in header
+
+    def test_backslash_and_quote_replaced_with_space(self) -> None:
+        header = content_disposition("attachment", 'weird\\name"here.txt')
+        assert 'filename="weird name here.txt"' in header
+
+    def test_leading_trailing_control_chars_stripped(self) -> None:
+        header = content_disposition("attachment", "\r\nevil.txt\r\n")
+        assert 'filename="evil.txt"' in header
+
+    def test_collapsed_runs_of_spaces_become_single_space(self) -> None:
+        header = content_disposition("attachment", "evil\r\n  name.txt")
+        assert 'filename="evil name.txt"' in header
+
+    def test_extended_value_omitted_when_fallback_matches_exactly(self) -> None:
+        header = content_disposition("attachment", "plain-name_1.0.txt")
+        assert "filename*=" not in header
+
+    def test_extended_value_present_when_filename_changes(self) -> None:
+        header = content_disposition("attachment", "bad\x00name.txt")
+        assert "filename*=UTF-8''bad%00name.txt" in header
+
+
+class TestFileHeaders:
+
+    def test_no_filename_plain_content_type(self) -> None:
+        headers = file_headers("application/json")
+        assert headers == {"Content-Type": "application/json"}
+
+    def test_no_filename_html_gets_explicit_charset(self) -> None:
+        headers = file_headers("text/html")
+        assert headers == {"Content-Type": "text/html; charset=utf-8"}
+
+    def test_empty_filename_is_treated_as_no_filename(self) -> None:
+        headers = file_headers("text/html", "")
+        assert headers == {"Content-Type": "text/html; charset=utf-8"}
+
+    def test_filename_defaults_to_attachment(self) -> None:
+        headers = file_headers("application/pdf", "report.pdf")
+        assert headers["Content-Type"] == "application/pdf"
+        assert headers["Content-Disposition"] == 'attachment; filename="report.pdf"'
+
+    def test_filename_with_download_false_is_inline(self) -> None:
+        headers = file_headers("application/pdf", "report.pdf", download=False)
+        assert headers["Content-Disposition"] == 'inline; filename="report.pdf"'
+
+    def test_html_with_filename_has_no_extra_charset(self) -> None:
+        # Content-Disposition takes over as the delivery hint; no bare-HTML charset guessing to guard against.
+        headers = file_headers("text/html", "page.html")
+        assert headers["Content-Type"] == "text/html"
 
 
 class TestHttpRangeRequest:

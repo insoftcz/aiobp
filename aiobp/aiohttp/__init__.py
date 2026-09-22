@@ -9,6 +9,7 @@
 # - importing with aliases (from web import router as router)
 
 from aiobp.aiohttp._connection import ClientAddress, ServerHostname
+from aiobp.aiohttp._headers import content_disposition, file_headers
 from aiobp.aiohttp._http_range import HttpRangeRequest, http_range, range_headers
 from aiobp.aiohttp._provider import (
     ApiError,
@@ -45,6 +46,8 @@ __all__ = [
     "ServerError",
     "ServerHostname",
     "WebServer",
+    "content_disposition",
+    "file_headers",
     "http_range",
     "range_headers",
     "router",
