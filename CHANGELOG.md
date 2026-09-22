@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [2.2.0] - 2026-09-22
+
+### 🚀 Features
+
+- Add content_disposition/file_headers helpers for file responses
+   - Build RFC 6266-safe Content-Disposition headers for arbitrary filenames
+(including ones with control characters, quotes, or non-ASCII names),
+plus a file_headers() convenience wrapper that also sets an explicit
+charset on bare text/html responses. 
+
+
 ## [2.1.0] - 2026-09-16
 
 ### 🚀 Features
