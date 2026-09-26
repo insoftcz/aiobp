@@ -28,6 +28,11 @@ tracing_otel = [
 ]
 aiohttp = [
     "aiohttp>=3.13.3",
+    "msgspec>=0.19.0",
+]
+nats = [
+    "msgspec>=0.19.0",
+    "nats-py>=2.16.0",
 ]
 
 [dependency-groups]
