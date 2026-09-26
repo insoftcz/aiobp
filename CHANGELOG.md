@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 
+## [2.3.0] - 2026-09-26
+
+### 🚀 Features
+
+- Added NATS message broker support
+
+
 ## [2.2.0] - 2026-09-22
 
 ### 🚀 Features
