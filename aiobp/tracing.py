@@ -2,9 +2,11 @@
 
 import logging
 import os
+import secrets
 import socket
 import traceback
-from contextlib import asynccontextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Optional
 
 from aiobp._otel import endpoint_reachable
@@ -12,6 +14,7 @@ from aiobp._otel import endpoint_reachable
 log = logging.getLogger(__name__)
 
 try:
+    from opentelemetry import context as otel_context
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.propagate import extract, inject
@@ -36,19 +39,16 @@ def setup_tracing(service_name: str, service_version: str, endpoint: Optional[st
         setup_logging("my-service", config.log)
         setup_tracing("my-service", __version__, config.log.otel_endpoint)
 
-    If ``endpoint`` is falsy or OpenTelemetry packages are not installed,
-    tracing is disabled and ``traced()`` becomes a no-op.
+    Without ``endpoint`` (or when it is unreachable) spans are still created
+    but not exported: trace ids keep flowing through ``propagation_headers()``
+    and NATS headers, so a trace another service started continues through
+    this one and log lines can carry its id. Only when OpenTelemetry packages
+    are not installed does ``traced()`` become a no-op.
     """
     global _tracer
-    if not endpoint:
-        log.info("OTEL tracing disabled (no endpoint configured)")
-        return
     if not _OTEL:
         log.warning("OpenTelemetry unavailable (%s: %s), tracing disabled",
                     type(_OTEL_IMPORT_ERROR).__name__, _OTEL_IMPORT_ERROR)
-        return
-    if not endpoint_reachable(endpoint):
-        log.error("OTEL endpoint %s unreachable, tracing disabled", endpoint)
         return
 
     resource = Resource.create({
@@ -57,10 +57,15 @@ def setup_tracing(service_name: str, service_version: str, endpoint: Optional[st
         HOST_NAME: socket.gethostname(),
     })
     provider = TracerProvider(resource=resource)
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True)))
+    if not endpoint:
+        log.info("OTEL tracing without export (no endpoint configured)")
+    elif not endpoint_reachable(endpoint):
+        log.error("OTEL endpoint %s unreachable, tracing without export", endpoint)
+    else:
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True)))
+        log.info("OTEL tracing enabled: %s", endpoint)
     trace.set_tracer_provider(provider)
     _tracer = trace.get_tracer(service_name)
-    log.info("OTEL tracing enabled: %s", endpoint)
 
 
 def current_span():
@@ -103,6 +108,56 @@ def propagation_headers() -> dict[str, str]:
     carrier: dict[str, str] = {}
     inject(carrier)
     return carrier
+
+
+def trace_id() -> str:
+    """Hex trace id of the current span (for log lines), or empty if none."""
+    if not _OTEL:
+        return ""
+    span_context = trace.get_current_span().get_span_context()
+    return format(span_context.trace_id, "032x") if span_context.is_valid else ""
+
+
+def context_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[Any]:
+    """OTel context carried by incoming message headers, or None without a traceparent
+
+    Header names are matched case-insensitively: senders differ (Python writes
+    ``traceparent``, Go's ``http.Header`` ``Traceparent``).
+    """
+    if not _OTEL or not headers:
+        return None
+    carrier = {key.lower(): value for key, value in headers.items() if isinstance(value, str)}
+    if "traceparent" not in carrier:
+        return None
+    return extract(carrier)
+
+
+@contextmanager
+def use_context(context: Optional[Any]) -> Iterator[None]:
+    """Run the block inside ``context`` (from ``context_from_headers()``) without a new span
+
+    Spans started and headers sent within the block continue that trace.
+    ``None`` leaves the current context as it is.
+    """
+    if not _OTEL or context is None:
+        yield
+        return
+    token = otel_context.attach(context)
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+def new_traceparent(trace_id: Optional[str] = None) -> str:
+    """Return a new W3C traceparent (sampled) with a random span id; works without OpenTelemetry
+
+    For services that only relay traces: start one when the caller didn't send
+    it, or turn a bare 32-hex trace id (e.g. an ``X-Trace-Id`` header) into a
+    traceparent.
+    """
+    tid = trace_id.lower() if trace_id and len(trace_id) == 32 else secrets.token_hex(16)  # noqa: PLR2004 - W3C length
+    return f"00-{tid}-{secrets.token_hex(8)}-01"
 
 
 @asynccontextmanager

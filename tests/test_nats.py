@@ -19,6 +19,7 @@ from nats.errors import TimeoutError as NatsTimeoutError
 from nats.js import errors as js_errors
 
 from aiobp.nats import Bucket, BucketEntry, Nats, NatsConfig, RpcError
+from aiobp.tracing import setup_tracing, trace_id, traced
 
 NATS_SERVER = shutil.which("nats-server")
 # the aiobp package re-exports the runner() function under the module's name
@@ -816,3 +817,93 @@ class TestBucket:
         # the watcher's subscription must be gone, or a fresh watch() would see it linger
         await bucket.put("after-cancel", 1)
         assert await bucket.get("after-cancel") == 1
+
+
+# ---------------------------------------------------------------------------
+# Streams
+# ---------------------------------------------------------------------------
+
+
+class TestKeepStream:
+
+    async def test_creates_stream_that_keeps_read_messages(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        name, prefix = unique("KEEP"), unique("keep")
+        await nats.keep_stream(name, [f"{prefix}.>"], max_age=3600, max_bytes=1 << 20)
+        await nats.publish(f"{prefix}.x", {"n": 1})  # a plain publish is captured
+        await nats.client.flush()
+        info = await nats.jetstream.stream_info(name)
+        assert info.config.max_age == 3600
+        assert info.config.max_bytes == 1 << 20
+
+        # reading does not consume: the same message can be read again and again
+        for _ in range(2):
+            msg = await nats.jetstream.get_msg(name, seq=1)
+            assert msgspec.json.decode(msg.data) == {"n": 1}
+
+    async def test_repairs_deleted_and_changed_stream(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        name, prefix = unique("KEEP"), unique("keep")
+        await nats.keep_stream(name, [f"{prefix}.>"], max_age=60)
+        await nats.jetstream.update_stream(name=name, subjects=[f"{prefix}.other"])
+        await nats._check_streams()  # what the periodic check and a reconnect run  # noqa: SLF001
+        assert (await nats.jetstream.stream_info(name)).config.subjects == [f"{prefix}.>"]
+
+        await nats.jetstream.delete_stream(name)
+        await nats._check_streams()  # noqa: SLF001
+        assert (await nats.jetstream.stream_info(name)).config.max_age == 60
+
+
+# ---------------------------------------------------------------------------
+# Tracing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tracing() -> None:
+    """Trace ids without an exporter, as every service using setup_tracing(..., None) gets"""
+    setup_tracing("aiobp-tests", "0", None)
+
+
+TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+
+@pytest.mark.usefixtures("tracing")
+class TestTracing:
+
+    async def test_event_handler_runs_in_senders_trace(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("traced")
+        seen: list[str] = []
+        await b.subscribe(subject, lambda _s, _d: seen.append(trace_id()))
+        async with traced("sender", traceparent=TRACEPARENT):
+            await a.publish(subject, {"x": 1})
+        await wait_until(lambda: len(seen) == 1)
+        assert seen == [TRACE_ID]
+
+    async def test_rpc_handler_runs_in_callers_trace(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        method = unique("traced.rpc")
+        await b.serve(method, trace_id)
+        async with traced("caller", traceparent=TRACEPARENT):
+            assert await a.call(method) == TRACE_ID
+
+    async def test_consumer_handler_runs_in_publishers_trace(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        prefix = await add_stream(a)
+        seen: list[str] = []
+        await b.consume(f"{prefix}.x", lambda _s, _d: seen.append(trace_id()))
+        async with traced("publisher", traceparent=TRACEPARENT):
+            await a.publish(f"{prefix}.x", "job")
+        await wait_until(lambda: len(seen) == 1)
+        assert seen == [TRACE_ID]
+
+    async def test_untraced_message_starts_nothing(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("untraced")
+        seen: list[str] = []
+        await b.subscribe(subject, lambda _s, _d: seen.append(trace_id()))
+        await a.publish(subject, {"x": 1})
+        await wait_until(lambda: len(seen) == 1)
+        assert seen == [""]

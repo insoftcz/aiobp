@@ -17,12 +17,13 @@ from nats.errors import ConnectionClosedError
 from nats.errors import TimeoutError as NatsTimeoutError
 from nats.js import JetStreamContext
 from nats.js import errors as js_errors
-from nats.js.api import ConsumerConfig
+from nats.js.api import ConsumerConfig, DiscardPolicy, RetentionPolicy, StorageType, StreamConfig
 from nats.js.kv import KeyValue
 
 from aiobp.logging import log
 from aiobp.runner import on_shutdown
 from aiobp.task import create_task
+from aiobp.tracing import context_from_headers, propagation_headers, traced, use_context
 
 if TYPE_CHECKING:
     from nats.aio.subscription import Subscription
@@ -40,6 +41,8 @@ _FETCH_TIMEOUT = 5.0
 _FETCH_RETRY_DELAY = 1.0
 # JetStream consumer names may not contain whitespace, ".", "*", ">" or path separators.
 _INVALID_DURABLE_CHARS = re.compile(r"[\s.*>/\\]")
+# How often keep_stream() re-checks its streams (besides after every reconnect).
+_STREAM_CHECK_INTERVAL = 60.0
 
 _encoder = msgspec.json.Encoder()
 _decoder = msgspec.json.Decoder()
@@ -307,7 +310,8 @@ class _Consumer:
         # let the keepalive task start, cancelling it before its first step would leave its coroutine never awaited
         await asyncio.sleep(0)
         try:
-            await _invoke(self.handler, msg.subject, data)
+            with use_context(context_from_headers(msg.headers)):
+                await _invoke(self.handler, msg.subject, data)
             succeeded = True
         except Exception:  # noqa: BLE001 - NAK so another consumer retries it right away
             log.trace("Consumer %s failed to handle %s", self.durable, msg.subject)
@@ -339,7 +343,12 @@ class Nats:
     - RPC: `call()` or `rpc.<method>(...)` to call, `serve()` to handle calls;
       wire format is request `[args, kwargs]` and reply `[1, result]` on success
       or `[code, message]` on failure, sent to subject `rpc.<method>`
-    - JetStream: `consume()` for durable work queues, `bucket()` for key-value storage
+    - JetStream: `consume()` for durable work queues, `bucket()` for key-value
+      storage, `keep_stream()` to own a stream
+
+    Tracing: everything sent carries the current trace in a `traceparent`
+    header, and every handler (events, RPC, consumers) runs inside the trace
+    of the message it handles — so one trace follows a request across services.
 
     `client` and `jetstream` expose the underlying nats-py objects for anything else.
     """
@@ -363,6 +372,8 @@ class Nats:
         self._rpc_tasks: set[asyncio.Task] = set()
         self._consumers: dict[str, _Consumer] = {}
         self._buckets: dict[str, Bucket] = {}
+        self._streams: dict[str, StreamConfig] = {}  # kept by keep_stream()
+        self._stream_keeper: Optional[asyncio.Task] = None
         self._closing: bool = False
 
     @property
@@ -410,6 +421,8 @@ class Nats:
 
         log.info("Disconnecting from NATS as %s", self._connection_name)
         self._closing = True
+        if self._stream_keeper is not None:
+            self._stream_keeper.cancel()
         for subject in list(self._consumers):
             await self.stop_consumer(subject)
         for subscription in self._rpc_subscriptions.values():
@@ -431,13 +444,16 @@ class Nats:
 
     async def _on_reconnected(self) -> None:
         log.info("Connection to NATS server reestablished: %s", self._client.connected_url)
+        if self._streams:
+            # the server may have lost them (restart without storage, manual delete)
+            create_task(self._check_streams(), "NATS streams check")
 
     # --- events ---
 
     async def publish(self, subject: str, data: Any) -> None:  # noqa: ANN401
         """Publish event, `bytes` are sent as they are, anything else is encoded as JSON"""
         payload = data if isinstance(data, bytes) else _encoder.encode(data)
-        await self._client.publish(subject, payload)
+        await self._client.publish(subject, payload, headers=propagation_headers() or None)
 
     async def subscribe(
         self,
@@ -469,7 +485,8 @@ class Nats:
                     log.warning("Invalid JSON event on %s: %r", msg.subject, msg.data[:200])
                     return
             try:
-                await _invoke(handler, msg.subject, data)
+                with use_context(context_from_headers(msg.headers)):
+                    await _invoke(handler, msg.subject, data)
             except Exception:  # noqa: BLE001 - one bad event must not kill the subscription
                 log.trace('Error handling NATS event "%s"', msg.subject)
 
@@ -491,7 +508,11 @@ class Nats:
 
     async def request(self, subject: str, payload: bytes, *, timeout: Optional[float] = None) -> bytes:
         """Send raw request and return raw reply payload"""
-        msg = await self._client.request(subject, payload, timeout=self._rpc_timeout if timeout is None else timeout)
+        msg = await self._client.request(
+            subject, payload,
+            timeout=self._rpc_timeout if timeout is None else timeout,
+            headers=propagation_headers() or None,
+        )
         return msg.data
 
     async def call(
@@ -549,7 +570,8 @@ class Nats:
 
         call = _log_call(method, args, kwargs)
         try:
-            result = await _invoke(handler, *args, **kwargs)
+            async with traced(f"RPC {method}", context=context_from_headers(msg.headers)):
+                result = await _invoke(handler, *args, **kwargs)
         except RpcError as error:
             log.warning("%s -> RpcError(%s)", call, error.message)
             await self._reply(msg, error.code, error.message)
@@ -613,6 +635,64 @@ class Nats:
         self._consumers[subject] = consumer
         consumer.start(concurrency)
         log.info("Consumer %s processing %s from stream %s", durable, subject, stream)
+
+    async def keep_stream(
+        self,
+        name: str,
+        subjects: Sequence[str],
+        *,
+        max_age: Optional[float] = None,
+        max_bytes: Optional[int] = None,
+    ) -> None:
+        """Own JetStream stream `name`: create it, and keep it existing with this configuration
+
+        The stream is created or updated now, again after every reconnect and
+        every minute, so a deleted or changed stream is repaired. Retention is by
+        limits: messages stay and can be read any number of times until they are
+        older than `max_age` seconds or `max_bytes` pushes out the oldest.
+        """
+        config = StreamConfig(
+            name=name,
+            subjects=list(subjects),
+            retention=RetentionPolicy.LIMITS,
+            discard=DiscardPolicy.OLD,
+            storage=StorageType.FILE,
+            max_age=max_age,
+            max_bytes=max_bytes,
+        )
+        self._streams[name] = config
+        await self._ensure_stream(config)
+        if self._stream_keeper is None:
+            self._stream_keeper = create_task(self._keep_streams(), "NATS streams keeper")
+
+    async def _keep_streams(self) -> None:
+        while True:
+            await asyncio.sleep(_STREAM_CHECK_INTERVAL)
+            await self._check_streams()
+
+    async def _check_streams(self) -> None:
+        for config in list(self._streams.values()):
+            try:
+                await self._ensure_stream(config)
+            except Exception:  # noqa: BLE001 - try again at the next check
+                log.trace("Keeping stream %s failed", config.name)
+
+    async def _ensure_stream(self, config: StreamConfig) -> None:
+        assert config.name is not None  # noqa: S101 - keep_stream() always sets it, narrows for mypy
+        try:
+            info = await self._js.stream_info(config.name)
+        except js_errors.NotFoundError:
+            await self._js.add_stream(config)
+            log.info("Created stream %s for %s", config.name, ", ".join(config.subjects or []))
+            return
+        current = info.config
+        if (
+            sorted(current.subjects or []) != sorted(config.subjects or [])
+            or (current.max_age or 0) != (config.max_age or 0)
+            or (current.max_bytes or -1) != (config.max_bytes or -1)
+        ):
+            await self._js.update_stream(config)
+            log.info("Updated stream %s to its configured subjects and limits", config.name)
 
     async def stop_consumer(self, subject: str) -> None:
         """Stop consuming `subject`, letting messages being processed finish"""

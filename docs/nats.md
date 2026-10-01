@@ -202,6 +202,39 @@ await nats.delete_bucket("settings")
 Values are stored as JSON. `bucket.kv` is the underlying nats-py `KeyValue`
 for anything else (watching, history, revisions).
 
+Owning a stream
+---------------
+
+A service that owns a JetStream stream declares it once:
+
+```python
+await nats.keep_stream("CALLTRACE", ["up.*.ev.>", "up.*.audit", "cc.*.>"],
+                       max_age=7 * 86400, max_bytes=2 * 1024**3)
+```
+
+The stream is created or updated right away, again after every reconnect and
+every minute — a stream someone deleted or changed is repaired. Other
+services don't need to know about it: whatever they publish on matching
+subjects is captured. Retention is by limits: reading a message doesn't remove
+it, it stays until it is older than `max_age` seconds or `max_bytes` pushes out
+the oldest.
+
+Tracing
+-------
+
+With `aiobp.tracing.setup_tracing()` called, the connector carries W3C trace
+context through NATS headers:
+
+- `publish()`, `request()` and `call()` send the current trace in a
+  `traceparent` header,
+- event handlers, consumer handlers and RPC handlers run inside the trace of
+  the message they handle (an RPC handler gets its own `RPC <method>` span),
+
+so one trace follows a request across services, and `trace_id()` gives its id
+for log lines. Messages without a `traceparent` start nothing. Services on
+plain nats-py can use `propagation_headers()` / `context_from_headers()` /
+`use_context()` from `aiobp.tracing` to take part.
+
 Shutdown
 --------
 

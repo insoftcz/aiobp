@@ -171,6 +171,27 @@ if span:
 
 If tracing isn't configured, `start_span` returns a no-op span; calling `.end()` on it is harmless.
 
+### Propagation
+
+Trace context crosses service boundaries in `traceparent` headers (the
+`aiobp.nats` connector does this by itself, see docs/nats.md):
+
+```python
+from aiobp.tracing import context_from_headers, propagation_headers, trace_id, use_context
+
+await client.publish(subject, payload, headers=propagation_headers())  # send the current trace
+
+with use_context(context_from_headers(msg.headers)):                   # continue the sender's trace
+    log.info("handling %s (trace %s)", msg.subject, trace_id())
+```
+
+`new_traceparent()` starts a trace (or wraps a bare trace id) without
+OpenTelemetry installed — for services that only relay traces.
+
 ### Graceful Fallback
 
-If `setup_tracing` is never called, or the OpenTelemetry packages aren't installed, `traced()` becomes a no-op. Application code using `traced()` and `current_span()` works unchanged whether tracing is on or off.
+Without an endpoint (or when it is unreachable) `setup_tracing` still installs
+a tracer: spans get real trace ids and propagate, they are just not exported.
+If `setup_tracing` is never called, or the OpenTelemetry packages aren't
+installed, `traced()` becomes a no-op. Application code using `traced()` and
+`current_span()` works unchanged whether tracing is on or off.
