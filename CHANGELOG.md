@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 
 
+## [2.4.0] - 2026-10-13
+
+### 🚀 Features
+
+- Add separate console logging level
+   - New `console` option in LoggingConfig (default INFO) sets the console
+handler level independently of `level`, which now applies to file and
+OTEL output.
+Added because under systemd console output ends up in syslog,
+so keeping it at INFO avoids spamming syslog with debug messages. 
+
+
 ## [2.3.0] - 2026-09-26
 
 ### 🚀 Features
