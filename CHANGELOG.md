@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file.
 
 
+## [3.0.0] - 2026-10-13
+
+### 🚀 Features
+
+- [**breaking**] Require Python 3.11 (was 3.9), ordered NATS events with optional headers
+
+### 🐛 Bug Fixes
+
+- Make sure NATS subscriptions are active before subscribe/serve return
+   -    - nats-py queues SUB for its flusher task but writes PING straight to
+the socket, so a single flush() sent PING before SUB and returned before
+the server registered the subscription. An immediate call() from another
+connection could then fail with NoRespondersError. Flushing twice puts
+the second PING after SUB on the wire. 
+
+
 ## [2.4.0] - 2026-10-13
 
 ### 🚀 Features
