@@ -59,6 +59,7 @@ Add OTEL settings to your `LoggingConfig`:
 ```ini
 [log]
 level = DEBUG
+console = INFO
 filename = service.log
 otel_endpoint = http://localhost:4317
 otel_export_interval = 5
@@ -66,6 +67,8 @@ otel_export_interval = 5
 
 | Option               | Default | Description                                      |
 |----------------------|---------|--------------------------------------------------|
+| level                | DEBUG   | Log level for file and OTEL output               |
+| console              | INFO    | Log level for console output (under systemd it goes to syslog) |
 | otel_endpoint        | None    | OTLP gRPC endpoint (e.g. http://localhost:4317)  |
 | otel_export_interval | 5       | Export interval in seconds (0 = instant export)  |
 

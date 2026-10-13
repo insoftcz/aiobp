@@ -17,6 +17,7 @@ class LoggingConfig:
     """Loging configuration"""
 
     level: str = "DEBUG"
+    console: str = "INFO"
     filename: Optional[str] = None
     otel_endpoint: Optional[str] = None  # e.g. "http://localhost:4317"
     otel_export_interval: int = 5  # seconds, 0 = instant
@@ -142,13 +143,15 @@ def setup_logging(service_name: str, config: Optional[LoggingConfig] = None) -> 
     console_handler.setFormatter(
         ColorFormatter(f"%(asctime)s [{Color.green}%(filename)s:%(lineno)d{Color.reset}] %(message)s"),
     )
-    handlers = [console_handler]
+    console_handler.setLevel(config.console)
+    handlers: list[logging.Handler] = [console_handler]
 
     if config and config.filename is not None:
         file_handler = logging.handlers.WatchedFileHandler(filename=config.filename)
         file_handler.setFormatter(
             PrefixExceptionFormatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"),
         )
+        file_handler.setLevel(config.level)
         handlers.append(file_handler)
 
     if config and config.otel_endpoint is not None:
@@ -157,6 +160,7 @@ def setup_logging(service_name: str, config: Optional[LoggingConfig] = None) -> 
         if otel_handler:
             handlers.append(otel_handler)
 
-    logging.basicConfig(level=config.level if config else None, handlers=handlers)
+    # root logger must pass records needed by the most verbose handler, each handler filters by its own level
+    logging.basicConfig(level=min(handler.level for handler in handlers), handlers=handlers)
 
     sys.excepthook = log_unhandled_exception

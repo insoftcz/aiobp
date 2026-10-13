@@ -76,3 +76,30 @@ def test_not_surpressed_exception() -> None:
         raise AssertionError("Not listed exception was surpressed")
     except TypeError:
         pass
+
+
+def test_console_level_separate_from_file_level(tmp_path, capsys) -> None:
+    from aiobp.logging import LoggingConfig, setup_logging
+
+    root = logging.getLogger()
+    old_handlers, old_level = root.handlers[:], root.level
+    root.handlers.clear()
+    try:
+        log_file = tmp_path / "test.log"
+        setup_logging("test", LoggingConfig(level="DEBUG", console="WARNING", filename=str(log_file)))
+        logging.debug("debug message")
+        logging.warning("warning message")
+        for handler in root.handlers:
+            handler.flush()
+    finally:
+        for handler in root.handlers:
+            handler.close()
+        root.handlers[:] = old_handlers
+        root.setLevel(old_level)
+
+    console = capsys.readouterr().out
+    assert "debug message" not in console
+    assert "warning message" in console
+    content = log_file.read_text()
+    assert "debug message" in content
+    assert "warning message" in content
