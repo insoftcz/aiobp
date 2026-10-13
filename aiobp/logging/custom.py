@@ -5,7 +5,7 @@ import logging.handlers
 import sys
 from dataclasses import dataclass
 from types import TracebackType
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 from aiobp._otel import endpoint_reachable
 
@@ -18,8 +18,8 @@ class LoggingConfig:
 
     level: str = "DEBUG"
     console: str = "INFO"
-    filename: Optional[str] = None
-    otel_endpoint: Optional[str] = None  # e.g. "http://localhost:4317"
+    filename: str | None = None
+    otel_endpoint: str | None = None  # e.g. "http://localhost:4317"
     otel_export_interval: int = 5  # seconds, 0 = instant
 
 
@@ -103,7 +103,7 @@ def _setup_otel_logging(
     service_name: str,
     level: str,
     interval: int = 5,
-) -> Optional[logging.Handler]:
+) -> logging.Handler | None:
     """Setups OpenTelemetry logging handler"""
     try:
         from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
@@ -134,7 +134,7 @@ def _setup_otel_logging(
     return handler
 
 
-def setup_logging(service_name: str, config: Optional[LoggingConfig] = None) -> None:
+def setup_logging(service_name: str, config: LoggingConfig | None = None) -> None:
     """Setups Python logger"""
     if config is None:
         config = LoggingConfig()

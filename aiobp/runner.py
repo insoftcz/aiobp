@@ -5,9 +5,9 @@ import contextlib
 import signal
 import sys
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 from aiobp.logging import log
 from aiobp.task import create_task
@@ -19,7 +19,7 @@ def on_shutdown(
     # instead of ..., there should be generic TypeVar reflected to args
     # however python type system doesn't seem to be capable of that yet
     coroutine: Callable[..., Coroutine],
-    args: Optional[list[Any]] = None,
+    args: list[Any] | None = None,
     *,
     after_tasks_cancel: bool = False,
 ) -> None:
@@ -40,7 +40,7 @@ def on_shutdown(
     log.debug("Will call %s(%s) on shutdown %s tasks cancelation", coroutine, log_args, log_when)
 
 
-def log_awaitable(awaitable: Union[asyncio.Task, Coroutine]) -> str:
+def log_awaitable(awaitable: asyncio.Task | Coroutine) -> str:
     """Make good task description for log"""
     coroutine = awaitable.get_coro() if isinstance(awaitable, asyncio.Task) else awaitable
     if not asyncio.iscoroutine(coroutine):
@@ -59,7 +59,6 @@ def log_awaitable(awaitable: Union[asyncio.Task, Coroutine]) -> str:
     return f'<{awaitable.get_name()} {filename}:{code.co_firstlineno} metod "{code.co_name}">'
 
 
-# Needed up to Python 3.10, when we upgrade to Python 3.11 we can use builtin asyncio.run()
 def runner(
     service_name: str,
     service_version: str,
@@ -87,13 +86,15 @@ def runner(
     as critical, and graceful shutdown proceeds anyway.
     """
     log.info("Starting service %s %s on Python %s", service_name, service_version, sys.version.replace("\n", ""))
-    loop = asyncio.get_event_loop()
+    loop_runner = asyncio.Runner()
     # main does:
     # 1. start given service coroutine as task
     # 2. add SIGTERM and SIGINT handlers
     # 3. waits for kill or KeyboardInterrupt
     try:
-        loop.run_until_complete(__main(service, endless=endless))
+        loop_runner.run(__main(service, endless=endless))
+    except KeyboardInterrupt:  # Ctrl+C before __shutdown() installed its signal handlers
+        log.info("Interrupted")
     except Exception:  # noqa: BLE001 - yes, we want to catch it and log it
         log.critical("Unhandled exception in service")
     # graceful_shutdown does:
@@ -102,13 +103,17 @@ def runner(
     # 3. await tasks to finish in specified shutdown_timeout
     # 4. calls all registered coroutines via on_shutdown(..., after_tasks_cancel=True) in LIFO order
     log.info("Shutting down service %s %s", service_name, service_version)
-    loop.run_until_complete(__graceful_shutdown(shutdown_timeout))
+    loop_runner.run(__graceful_shutdown(shutdown_timeout))
+    # Runner.close() cancels remaining tasks and waits for them without any timeout, a task
+    # ignoring cancellation would block the exit forever — leave the loop as it is then.
+    if not asyncio.all_tasks(loop_runner.get_loop()):
+        loop_runner.close()
 
 
 async def __shutdown() -> None:
     """Wait for CTRL+C or SIGTERM"""
     shutdown_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
     loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
     with contextlib.suppress(asyncio.CancelledError):
@@ -170,13 +175,18 @@ async def shutdown_coroutines(timeout: float, *, after_tasks_cancel: bool) -> fl
             timeout -= took
             continue
 
-        try:
-            result = await asyncio.wait_for(coroutine, timeout=timeout)
-            log.debug("Coroutine finished: %s(%s) -> %r", log_awaitable(coro), log_args, result)
-        except asyncio.TimeoutError:
+        # not wait_for(): on timeout it waits until the cancelled coroutine finishes, possibly forever
+        task = asyncio.ensure_future(coroutine)
+        await asyncio.wait({task}, timeout=max(timeout, 0))
+        if not task.done():
+            task.cancel()
             log.error("Coroutine did not finish in timeout: %s(%s)", log_awaitable(coro), log_args)
-        except Exception as error:  # noqa: BLE001 - yes, we want to catch it and log it
-            log.error("Coroutine shutdown failed %s(%s): %r", log_awaitable(coro), log_args, error)
+        elif task.cancelled():
+            log.error("Coroutine shutdown cancelled %s(%s)", log_awaitable(coro), log_args)
+        elif task.exception() is not None:
+            log.error("Coroutine shutdown failed %s(%s): %r", log_awaitable(coro), log_args, task.exception())
+        else:
+            log.debug("Coroutine finished: %s(%s) -> %r", log_awaitable(coro), log_args, task.result())
         took = time.time() - start
         timeout -= took
 
@@ -207,12 +217,13 @@ async def __shutdown_tasks(timeout: float) -> float:
         took = time.time() - start
         return timeout - took
 
-    try:
-        log.debug(f"Waiting up to {timeout:.3f} s for tasks to finish...")
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-        log.debug("All tasks finished within timeout")
-    except asyncio.TimeoutError:
+    log.debug(f"Waiting up to {timeout:.3f} s for tasks to finish...")
+    # not wait_for(gather()): on timeout it waits for tasks ignoring cancellation, possibly forever
+    _, pending = await asyncio.wait(tasks, timeout=max(timeout, 0))
+    if pending:
         log.warning("Nope, they get interrupted")
+    else:
+        log.debug("All tasks finished within timeout")
 
     for task in tasks:
         if not task.done():

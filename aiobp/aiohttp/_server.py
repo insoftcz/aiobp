@@ -1,6 +1,6 @@
 """HTTP server"""
 
-from typing import Any, Optional
+from typing import Any
 
 from aiohttp import web
 from aiohttp.web_routedef import RouteTableDef
@@ -16,7 +16,7 @@ class WebServer:
         self,
         port: int,
         host: str = "127.0.0.1",
-        router: Optional[RouteTableDef] = router,
+        router: RouteTableDef | None = router,
         **kwargs: Any,
     ) -> None:
         self._port: int = port

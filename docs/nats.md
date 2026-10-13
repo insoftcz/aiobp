@@ -91,27 +91,71 @@ Events
 ```python
 await nats.publish("peer.change", {"name": "101", "status": 1})
 await nats.publish("peer.change", raw_bytes)  # bytes are sent unchanged
+await nats.publish("peer.change", data, headers={"X-Groups": "[1, 8]"})
 
 await nats.subscribe("peer.change", handler)       # handler(subject, data)
 await nats.subscribe("peer.>", handler)            # wildcards work
 await nats.subscribe("jobs", handler, queue="w")   # one subscriber of queue "w" gets each event
 await nats.subscribe("peer.>", handler, raw=True)  # data is undecoded bytes
-await nats.unsubscribe("peer.>")
+await nats.unsubscribe("peer.>", handler)          # the handler identifies the subscription
 ```
 
-Handlers may be plain functions or coroutines. Events of one subscription are
-handled one by one in the order they arrived. An exception in a handler is
+Handlers may be plain functions or coroutines. An exception in a handler is
 logged and the next event is handled normally.
+
+A handler that needs the event's NATS headers declares a parameter named
+`headers`, it gets them as a dict, empty when the event has none:
+
+```python
+def on_change(subject: str, data: dict, headers: dict[str, str]) -> None: ...
+def on_change(subject: str, data: dict, *, headers: dict[str, str]) -> None: ...  # also fine
+```
+
+The signature is checked once when subscribing, `headers` is passed as a keyword
+argument only to handlers having a parameter of exactly that name (or
+`**kwargs`). The same applies to JetStream consumers.
+
+Several handlers may subscribe to the same subject — e.g. independent components
+of one service. They share one NATS subscription per subject and queue group,
+the payload is decoded once and handlers are called one by one in the order they
+subscribed. The same handler can't subscribe to the same subject twice.
+
+`unsubscribe()` needs the same handler (and `queue`) that subscribed, the NATS
+subscription is removed with its last handler. Bound methods work as expected,
+`unsubscribe(subject, self.on_event)` matches `subscribe(subject, self.on_event)`.
+A lambda can only be unsubscribed when you keep a reference to it.
 
 Use `raw=True` to forward events without paying for decoding them, e.g.:
 
 ```python
-def forward(subject: str, data: bytes) -> None:
+def forward(subject: str, data: bytes, headers: dict[str, str]) -> None:
     frame = b"".join((b'{"method":"', subject.encode(), b'","params":[', data, b"]}"))
     websocket_broadcast(frame)
 
 await nats.subscribe(">", forward, raw=True)
 ```
+
+### Ordering
+
+Events of all subscriptions are handled one by one in the order they arrived,
+even across separate subscriptions: when a service publishes `call.new` and
+then `call.answer`, `call.answer` is handled only after the `call.new` handler
+finished. NATS keeps the order of events from one publisher, events from
+different publishers have no defined order.
+
+A handler that awaits slow I/O (database, HTTP) delays all other events until
+it finishes — start a task from the handler for such work. CPU heavy work blocks
+the whole event loop no matter how events are handled, run it in a thread
+(awaiting the thread still delays other events, wrap it in a task if it shouldn't):
+
+```python
+async def on_new(subject: str, data: dict) -> None:
+    calls[data["id"]] = data                        # fast, keeps the order
+    create_task(fetch_caller_info(data), "caller")  # slow I/O, runs concurrently
+    await asyncio.to_thread(parse_recording, data)  # CPU heavy, loop stays free
+```
+
+`create_task` comes from `aiobp.task`.
 
 RPC
 ---
@@ -146,6 +190,8 @@ Errors:
   `RpcError("Internal error", code=0)`. Internal details never leave the service.
 - When nobody serves the method, `call()` raises `nats.errors.NoRespondersError`.
   When the handler doesn't reply in time, it raises `nats.errors.TimeoutError`.
+- A reply that isn't in the RPC wire format (e.g. from a non-aiobp responder)
+  raises `RpcError("Invalid RPC reply: ...", code=0)`.
 
 Wire format, for services in other languages: the request is sent to subject
 `rpc.<method>` with payload `[args, kwargs]`; the reply is `[1, result]` on
@@ -211,6 +257,12 @@ can also call it yourself, calling it again does nothing. It:
 1. stops consumers, letting messages being processed finish and get acknowledged,
 2. stops accepting RPC calls and waits for calls already running to reply,
 3. delivers event messages already received and closes the connection.
+
+The runner calls it before it cancels tasks, so tasks can't use NATS while
+they are being cancelled: `publish()`, `call()` and the like raise nats-py's
+`ConnectionClosedError` then. Cleanup that only releases NATS resources is
+safe — `unsubscribe()` and `stop_consumer()` do nothing after `disconnect()`
+and `Bucket.watch()` ends with the task's `CancelledError`.
 
 Everything else
 ---------------

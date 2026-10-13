@@ -40,10 +40,10 @@ def _handle_unexpected_error(  # noqa: PLR0913
     error: Exception,
     request: web.Request,
     *,
-    on_error: Optional[Callable[[str, str, BaseException], Any]],
+    on_error: Callable[[str, str, BaseException], Any] | None,
     is_api_route: bool,
     provider: Provider,
-    content_type: Optional[str],
+    content_type: str | None,
     charset: str,
 ) -> web.StreamResponse:
     """Render an exception that isn't a ``web.HTTPException`` (so didn't already carry its own response).
@@ -64,7 +64,7 @@ def _handle_unexpected_error(  # noqa: PLR0913
     )
 
 
-class RouterType(str, Enum):
+class RouterType(str, Enum):  # noqa: UP042 - StrEnum would change str() and format() of members
     """Whether a route is documented in OpenAPI/Swagger or served as a plain, undocumented route."""
 
     API = "api"
@@ -83,11 +83,11 @@ class _PendingRoute:
     method: str
     path: str
     router_type: RouterType
-    content_type: Optional[str] = None
+    content_type: str | None = None
     charset: str = "utf-8"
-    tag: Optional[str] = None
-    secure: Optional[bool] = None
-    responses: Optional[dict[int, type]] = None
+    tag: str | None = None
+    secure: bool | None = None
+    responses: dict[int, type] | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
     api_router: Optional["ApiRouter"] = None
 
@@ -123,11 +123,11 @@ class ApiRouter:
     def __init__(  # noqa: PLR0913, PLR0917
         self,
         prefix: str = "/",
-        pending: Optional[list[_PendingRoute]] = None,
+        pending: list[_PendingRoute] | None = None,
         default_content_type: str = "application/json",
         default_charset: str = "utf-8",
-        on_result: Optional[Callable[[str, str, Any], Any]] = None,
-        on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
+        on_result: Callable[[str, str, Any], Any] | None = None,
+        on_error: Callable[[str, str, BaseException], Any] | None = None,
     ) -> None:
         if not prefix.startswith("/"):
             msg = f"ApiRouter prefix must start with '/', got {prefix!r}"
@@ -137,8 +137,8 @@ class ApiRouter:
         self._router_type: RouterType = RouterType.API
         self._default_content_type: str = default_content_type
         self._default_charset: str = default_charset
-        self.on_result: Optional[Callable[[str, str, Any], Any]] = on_result
-        self.on_error: Optional[Callable[[str, str, BaseException], Any]] = on_error
+        self.on_result: Callable[[str, str, Any], Any] | None = on_result
+        self.on_error: Callable[[str, str, BaseException], Any] | None = on_error
         self.docs: OpenAPIBuilder = OpenAPIBuilder()
 
     def _full_path(self, path: str) -> str:
@@ -152,10 +152,10 @@ class ApiRouter:
         method: str,
         path: str,
         *,
-        tag: Optional[str] = None,
-        secure: Optional[bool] = None,
-        content_type: Optional[str] = None,
-        responses: Optional[dict[int, type]] = None,
+        tag: str | None = None,
+        secure: bool | None = None,
+        content_type: str | None = None,
+        responses: dict[int, type] | None = None,
         **kwargs: Any,  # noqa: ANN401
     ) -> Callable[[T], T]:
         """Register a route.
@@ -182,25 +182,25 @@ class ApiRouter:
             return handler
         return decorate
 
-    def get(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def get(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_GET, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def post(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def post(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_POST, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def put(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def put(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_PUT, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def patch(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def patch(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_PATCH, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def delete(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def delete(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_DELETE, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def head(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def head(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_HEAD, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
-    def options(self, path: str, *, content_type: Optional[str] = None, responses: Optional[dict[int, type]] = None, secure: Optional[bool] = None, tag: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
+    def options(self, path: str, *, content_type: str | None = None, responses: dict[int, type] | None = None, secure: bool | None = None, tag: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # noqa: ANN401, E501
         return self.route(hdrs.METH_OPTIONS, path, tag=tag, secure=secure, content_type=content_type, responses=responses, **kwargs)  # noqa: E501
 
 
@@ -257,7 +257,7 @@ class Router(web.RouteTableDef):
             log.info("API docs available at %s/docs", base)
 
     @override
-    def route(self, method: str, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def route(self, method: str, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         """Register a route.
 
         Unrecognized keyword arguments (e.g. ``name=``, ``allow_head=``) are
@@ -280,31 +280,31 @@ class Router(web.RouteTableDef):
         return decorate
 
     @override
-    def get(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def get(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_GET, path, content_type=content_type, **kwargs)
 
     @override
-    def post(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def post(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_POST, path, content_type=content_type, **kwargs)
 
     @override
-    def put(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def put(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_PUT, path, content_type=content_type, **kwargs)
 
     @override
-    def patch(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def patch(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_PATCH, path, content_type=content_type, **kwargs)
 
     @override
-    def delete(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def delete(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_DELETE, path, content_type=content_type, **kwargs)
 
     @override
-    def head(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def head(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_HEAD, path, content_type=content_type, **kwargs)
 
     @override
-    def options(self, path: str, *, content_type: Optional[str] = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
+    def options(self, path: str, *, content_type: str | None = None, **kwargs: Any) -> Callable[[T], T]:  # type: ignore[override]
         return self.route(hdrs.METH_OPTIONS, path, content_type=content_type, **kwargs)
 
     def include(self, instance: object) -> None:  # noqa: C901
@@ -479,8 +479,8 @@ class BuiltinRouter(Router):
         self,
         default_content_type: str = "text/html",
         default_charset: str = "utf-8",
-        on_result: Optional[Callable[[str, str, Any], Any]] = None,
-        on_error: Optional[Callable[[str, str, BaseException], Any]] = None,
+        on_result: Callable[[str, str, Any], Any] | None = None,
+        on_error: Callable[[str, str, BaseException], Any] | None = None,
     ) -> None:
         super().__init__(default_content_type=default_content_type, default_charset=default_charset)
         self.api: ApiRouter = ApiRouter(pending=self._pending, on_result=on_result, on_error=on_error)

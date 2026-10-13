@@ -1,7 +1,7 @@
 """HTTP Range request support: parse Range headers, serve full or partial content."""
 
 import inspect
-from typing import Any, Optional, Protocol, Union
+from typing import Any, Protocol
 
 from aiohttp import hdrs, web
 from yarl import URL
@@ -12,7 +12,7 @@ _DEFAULT_CHUNK_SIZE = 32768
 _STREAM_CHUNK_SIZE = 65536
 
 
-def http_range(http_range_slice: slice) -> Optional[tuple[int, int]]:
+def http_range(http_range_slice: slice) -> tuple[int, int] | None:
     """Parse HTTP range request bytes"""
     range_start = http_range_slice.start
     range_stop = http_range_slice.stop
@@ -34,7 +34,7 @@ def range_headers(bytes_range: tuple[int, int], total_length: int) -> dict[str, 
     }
 
 
-def _parse_range_header(value: str) -> Optional[slice]:
+def _parse_range_header(value: str) -> slice | None:
     """Parse a ``Range: bytes=start-end`` header into a ``slice(start, end)`` of positions."""
     prefix = "bytes="
     if not value.startswith(prefix):
@@ -127,10 +127,10 @@ class HttpRangeRequest:
         self.response_headers: dict[str, str] = {}
         header = request.headers.get(hdrs.RANGE)
         parsed = _parse_range_header(header) if header else None
-        self._range: Optional[tuple[int, int]] = http_range(parsed) if parsed is not None else None
+        self._range: tuple[int, int] | None = http_range(parsed) if parsed is not None else None
 
     @property
-    def bytes_range(self) -> Optional[tuple[int, int]]:
+    def bytes_range(self) -> tuple[int, int] | None:
         """The requested (start, end) byte positions, or None if no Range header was sent."""
         return self._range
 
@@ -139,7 +139,7 @@ class HttpRangeRequest:
         """The request's URL."""
         return self._request.url
 
-    def slice_response(self, data: Union[bytes, str]) -> web.StreamResponse:
+    def slice_response(self, data: bytes | str) -> web.StreamResponse:
         """Serve bytes/str already held in memory, sliced to the requested range."""
         total_length = len(data)
         if self._range is None:
@@ -156,7 +156,7 @@ class HttpRangeRequest:
         headers = {**range_headers((start, end), total_length), **self.response_headers}
         return self._to_response(piece, status=206, headers=headers)
 
-    def chunk_response(self, data: Union[bytes, str], total_length: int) -> web.StreamResponse:
+    def chunk_response(self, data: bytes | str, total_length: int) -> web.StreamResponse:
         """Wrap data that's already sliced to ``bytes_range``, given the resource's total length.
 
         Use this when the data source (e.g. a cache) does its own range slicing
@@ -176,12 +176,12 @@ class HttpRangeRequest:
         return self._to_response(data, status=206, headers=headers)
 
     @staticmethod
-    def _to_response(data: Union[bytes, str], *, status: int, headers: dict[str, str]) -> web.StreamResponse:
+    def _to_response(data: bytes | str, *, status: int, headers: dict[str, str]) -> web.StreamResponse:
         if isinstance(data, bytes):
             return web.Response(body=data, status=status, headers=headers)
         return web.Response(text=data, status=status, headers=headers)
 
-    async def stream_response(self, file: SeekableAsyncFile, total_length: Optional[int] = None) -> web.StreamResponse:
+    async def stream_response(self, file: SeekableAsyncFile, total_length: int | None = None) -> web.StreamResponse:
         """Serve an already-open file-like source in bounded chunks, without buffering it whole.
 
         Pass ``total_length`` explicitly when ``file`` doesn't support determining
@@ -242,7 +242,7 @@ class HttpRangeRequest:
         return await value if inspect.isawaitable(value) else value
 
     @staticmethod
-    def _clamp(bytes_range: tuple[int, int], total_length: int) -> Optional[tuple[int, int]]:
+    def _clamp(bytes_range: tuple[int, int], total_length: int) -> tuple[int, int] | None:
         """Clamp the requested range to the content length, or None if unsatisfiable."""
         start, end = bytes_range
         if start >= total_length:

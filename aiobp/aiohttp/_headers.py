@@ -1,7 +1,6 @@
 """Content-Type/Content-Disposition headers for file responses"""
 
 import re
-from typing import Optional
 from urllib.parse import quote
 
 # RFC 7230 field-value grammar only allows VCHAR / obs-text / SP / HTAB — strip everything
@@ -29,7 +28,7 @@ def content_disposition(disposition: str, filename: str) -> str:
     return header
 
 
-def file_headers(content_type: str, filename: Optional[str] = None, *, download: bool = True) -> dict[str, str]:
+def file_headers(content_type: str, filename: str | None = None, *, download: bool = True) -> dict[str, str]:
     """Build Content-Type/Content-Disposition headers for a file response
 
     With a `filename`, adds an RFC 6266 Content-Disposition header ("attachment" unless

@@ -4,7 +4,7 @@ import socket
 import sys
 import types
 from io import BytesIO
-from typing import Annotated, Any, Optional, TypedDict, Union
+from typing import Annotated, Any, Optional, TypedDict
 from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
@@ -48,15 +48,15 @@ from aiobp.aiohttp._provider import ArgumentError, Provider, RequestValidationEr
 
 def make_request(
     *,
-    match_info: Optional[dict] = None,
-    query: Optional[Union[dict, list[tuple[str, Any]]]] = None,
-    headers: Optional[dict] = None,
-    cookies: Optional[dict] = None,
+    match_info: dict | None = None,
+    query: dict | list[tuple[str, Any]] | None = None,
+    headers: dict | None = None,
+    cookies: dict | None = None,
     content_type: str = "",
-    body: Optional[bytes] = None,
+    body: bytes | None = None,
     json_body: object = None,
-    post_data: Optional[Union[dict, list[tuple[str, Any]]]] = None,
-    peername: Optional[tuple] = None,
+    post_data: dict | list[tuple[str, Any]] | None = None,
+    peername: tuple | None = None,
 ) -> aioweb.Request:
     """Build a minimal mock aiohttp Request."""
     request = MagicMock(spec=aioweb.Request)
@@ -97,7 +97,7 @@ class TestProviderGetAnnotation:
         assert source is None
 
     def test_optional_annotated(self) -> None:
-        hint = Optional[Annotated[str, Meta(description="x")]]
+        hint = Optional[Annotated[str, Meta(description="x")]]  # noqa: UP045 - typing.Optional form on purpose
         typ, optional, meta, source = Provider.get_annotation(hint)
         assert typ is str
         assert optional
@@ -163,7 +163,7 @@ class TestProviderGetAnnotation:
         assert source.kind == "path"
 
     def test_subscript_optional(self) -> None:
-        hint = Optional[QueryKey[str, "filter"]]
+        hint = Optional[QueryKey[str, "filter"]]  # noqa: UP045 - typing.Optional form on purpose
         typ, optional, meta, source = Provider.get_annotation(hint)
         assert typ is str
         assert optional
@@ -267,14 +267,14 @@ class TestProviderGatherArgs:
         assert ctx.value.errors[0].source == SourceKind.BODY
 
     async def test_optional_defaults_to_none(self) -> None:
-        async def handler(who: Optional[Annotated[str, Meta(description="name")]] = None) -> Optional[str]: ...
+        async def handler(who: Annotated[str, Meta(description="name")] | None = None) -> str | None: ...
         provider = self._make_provider(handler)
         request = make_request()
         args = await provider.gather_args(request)
         assert args["who"] is None
 
     async def test_optional_with_default(self) -> None:
-        async def handler(who: Optional[Annotated[str, Meta(description="name")]] = "Nobody") -> Optional[str]: ...
+        async def handler(who: Annotated[str, Meta(description="name")] | None = "Nobody") -> str | None: ...
         provider = self._make_provider(handler)
         request = make_request()
         args = await provider.gather_args(request)
@@ -567,7 +567,7 @@ class TestProviderGatherArgs:
             limit: int
 
         async def handler(
-            paging: Optional[Annotated[Paging, Meta(description="paging"), FromQuery]] = None,
+            paging: Annotated[Paging, Meta(description="paging"), FromQuery] | None = None,
         ) -> str: ...
         provider = self._make_provider(handler)
         request = make_request()
@@ -686,7 +686,7 @@ class TestProviderGatherArgs:
 
     async def test_body_key_optional_missing_returns_default(self) -> None:
         async def handler(
-            name: Optional[Annotated[str, Meta(description="name"), BodyKey]] = "fallback",
+            name: Annotated[str, Meta(description="name"), BodyKey] | None = "fallback",
         ) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(content_type="application/json", body=msgspec.json.encode({}))
@@ -751,7 +751,7 @@ class TestProviderGatherArgs:
 
     async def test_body_optional_empty_json_returns_default(self) -> None:
         async def handler(
-            name: Optional[Annotated[str, Meta(description="name"), FromBody]] = None,
+            name: Annotated[str, Meta(description="name"), FromBody] | None = None,
         ) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(content_type="application/json", body=b"")
@@ -760,7 +760,7 @@ class TestProviderGatherArgs:
 
     async def test_body_optional_empty_json_returns_provided_default(self) -> None:
         async def handler(
-            name: Optional[Annotated[str, Meta(description="name"), FromBody]] = "fallback",
+            name: Annotated[str, Meta(description="name"), FromBody] | None = "fallback",
         ) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(content_type="application/json", body=b"")
@@ -772,7 +772,7 @@ class TestProviderGatherArgs:
             name: str
 
         async def handler(
-            item: Optional[Annotated[Item, Meta(description="item"), FromBody]] = None,
+            item: Annotated[Item, Meta(description="item"), FromBody] | None = None,
         ) -> str: ...
         provider = self._make_provider(handler)
         request = make_request(content_type="application/x-www-form-urlencoded", post_data={})
@@ -1046,7 +1046,7 @@ class TestHttpRangeRequest:
         assert resp.headers["Content-Range"] == "bytes 2-5/20"
 
     async def test_bytes_range_exposes_start_and_end(self) -> None:
-        async def handler(range: HttpRangeRequest) -> Optional[tuple[int, int]]:
+        async def handler(range: HttpRangeRequest) -> tuple[int, int] | None:
             return range.bytes_range
 
         provider = self._make_provider(handler)
@@ -1055,7 +1055,7 @@ class TestHttpRangeRequest:
         assert await handler(**args) == (2, 5)
 
     async def test_bytes_range_is_none_without_range_header(self) -> None:
-        async def handler(range: HttpRangeRequest) -> Optional[tuple[int, int]]:
+        async def handler(range: HttpRangeRequest) -> tuple[int, int] | None:
             return range.bytes_range
 
         provider = self._make_provider(handler)
@@ -1283,7 +1283,7 @@ def build_app() -> aioweb.Application:
         return f"Hello, {who}"
 
     @router.api.get("/maybe")
-    async def maybe(who: Optional[Annotated[str, Meta(description="name")]] = "Nobody") -> str:
+    async def maybe(who: Annotated[str, Meta(description="name")] | None = "Nobody") -> str:
         return f"Hello, {who or 'Nobody'}"
 
     @router.get("/plain/{who}")
@@ -2210,8 +2210,8 @@ class TestOpenAPIBuilderParameters:
 
     def test_request_body_gets_a_synthesized_example(self) -> None:
         class PhoneSelector(msgspec.Struct, kw_only=True):
-            identifier: Optional[Annotated[str, Meta(description="Device identificator", examples=["1001"])]] = None
-            extension: Optional[str] = None
+            identifier: Annotated[str, Meta(description="Device identificator", examples=["1001"])] | None = None
+            extension: str | None = None
 
         async def handler(sel: FromBody[PhoneSelector, "selector"]) -> None: ...
         op = self._operation(handler)
@@ -2222,7 +2222,7 @@ class TestOpenAPIBuilderParameters:
     def test_response_gets_a_synthesized_example(self) -> None:
         class Item(msgspec.Struct, kw_only=True):
             name: Annotated[str, Meta(examples=["widget"])]
-            note: Optional[str] = None
+            note: str | None = None
 
         async def handler() -> Item: ...
         op = self._operation(handler)

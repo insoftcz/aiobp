@@ -1,7 +1,6 @@
 """Shared helpers for the optional OpenTelemetry integration."""
 
 import socket
-from typing import Optional
 from urllib.parse import urlparse
 
 _DEFAULT_OTLP_GRPC_PORT = 4317
@@ -24,7 +23,7 @@ def endpoint_reachable(endpoint: str, timeout: float = 1.0) -> bool:
         return False
 
 
-def _split_host_port(endpoint: str) -> tuple[Optional[str], int]:
+def _split_host_port(endpoint: str) -> tuple[str | None, int]:
     """Parse (host, port) from an OTLP endpoint, with or without a scheme."""
     raw = endpoint.strip()
     if "://" not in raw:

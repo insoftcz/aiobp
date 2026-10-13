@@ -5,7 +5,7 @@ import os
 import socket
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 from aiobp._otel import endpoint_reachable
 
@@ -27,7 +27,7 @@ except Exception as _e:  # broken installs raise more than ImportError (e.g. Sto
 _tracer = None  # opentelemetry.trace.Tracer when set
 
 
-def setup_tracing(service_name: str, service_version: str, endpoint: Optional[str]) -> None:
+def setup_tracing(service_name: str, service_version: str, endpoint: str | None) -> None:
     """Configure OpenTelemetry tracing. Call once at startup.
 
     Independent of ``setup_logging`` — works alone, or alongside it sharing
@@ -72,9 +72,9 @@ def current_span():
 
 def start_span(
     name: str,
-    attrs: Optional[dict[str, Any]] = None,
-    context: Optional[Any] = None,
-    traceparent: Optional[str] = None,
+    attrs: dict[str, Any] | None = None,
+    context: Any | None = None,
+    traceparent: str | None = None,
 ):
     """Start a span whose lifetime is managed manually — call ``.end()`` on it later.
 
@@ -108,9 +108,9 @@ def propagation_headers() -> dict[str, str]:
 @asynccontextmanager
 async def traced(
     name: str,
-    attrs: Optional[dict[str, Any]] = None,
-    context: Optional[Any] = None,
-    traceparent: Optional[str] = None,
+    attrs: dict[str, Any] | None = None,
+    context: Any | None = None,
+    traceparent: str | None = None,
     suppress: tuple[type[BaseException], ...] = (),
     errors_only: bool = False,
 ):

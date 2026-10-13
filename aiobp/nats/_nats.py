@@ -1,51 +1,43 @@
 """NATS message bus connector: events, RPC, JetStream consumers and key-value buckets"""
 
 import asyncio
-import inspect
 import re
-import reprlib
 import socket
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar, Union, overload
+from typing import TYPE_CHECKING, Any, overload
 
-import msgspec
 from nats.aio.client import Client
 from nats.aio.msg import Msg
-from nats.errors import ConnectionClosedError
-from nats.errors import TimeoutError as NatsTimeoutError
 from nats.js import JetStreamContext
 from nats.js import errors as js_errors
 from nats.js.api import ConsumerConfig
-from nats.js.kv import KeyValue
 
 from aiobp.logging import log
+from aiobp.nats._bucket import Bucket, K, V
+from aiobp.nats._common import EventHandler, encoder, invoke, wants_headers
+from aiobp.nats._consumer import Consumer
+from aiobp.nats._events import EventQueue, EventSubscription, HandlerOptions
+from aiobp.nats._rpc import (
+    RPC_OK,
+    RPC_PREFIX,
+    RpcError,
+    RpcHandler,
+    RpcProxy,
+    log_call,
+    parse_reply,
+    parse_request,
+    short_repr,
+)
 from aiobp.runner import on_shutdown
 from aiobp.task import create_task
 
 if TYPE_CHECKING:
     from nats.aio.subscription import Subscription
 
-EventHandler = Callable[[str, Any], Union[Awaitable[None], None]]
-RpcHandler = Callable[..., Any]
-K = TypeVar("K")
-V = TypeVar("V")
-
-_RPC_PREFIX = "rpc."
-_RPC_OK = 1
-# How long a consumer worker waits in a single fetch() before polling again. Idle workers are
-# cancelled on shutdown, so this doesn't delay it — it only bounds how stale a fetch can get.
-_FETCH_TIMEOUT = 5.0
-_FETCH_RETRY_DELAY = 1.0
 # JetStream consumer names may not contain whitespace, ".", "*", ">" or path separators.
 _INVALID_DURABLE_CHARS = re.compile(r"[\s.*>/\\]")
-
-_encoder = msgspec.json.Encoder()
-_decoder = msgspec.json.Decoder()
-_repr = reprlib.Repr()
-_repr.maxstring = 100
-_repr.maxother = 100
 
 
 @dataclass
@@ -56,276 +48,6 @@ class NatsConfig:
     """
 
     url: str = "nats://127.0.0.1:4222"
-
-
-class RpcError(Exception):
-    """RPC call failed on the remote side
-
-    Raise it from an RPC handler to reply with an error `message` (and optional
-    `code`) without logging a traceback — use it for expected failures such as
-    invalid arguments. `Nats.call()` raises it when the remote handler failed.
-    """
-
-    def __init__(self, message: str, code: int = 0) -> None:
-        if code == _RPC_OK:
-            msg = f"RPC error code can't be {_RPC_OK}, it means success"
-            raise ValueError(msg)
-        super().__init__(message)
-        self.message: str = message
-        self.code: int = code
-
-
-@dataclass
-class BucketEntry(Generic[V]):
-    """A bucket value together with its revision, for `Bucket.update()`'s optimistic concurrency check"""
-
-    value: V
-    revision: Optional[int]
-
-
-class Bucket(Generic[K, V]):
-    """JetStream key-value bucket with JSON encoded values of type `V`, keyed by `K`
-
-    The underlying nats-py `KeyValue` is available as `kv` for anything not covered here.
-    """
-
-    def __init__(
-        self, kv: KeyValue, *, value_type: Optional[type[V]] = None, key_type: Optional[type[K]] = None,
-    ) -> None:
-        self.kv: KeyValue = kv
-        self._decoder: msgspec.json.Decoder = msgspec.json.Decoder(type=value_type if value_type is not None else Any)
-        self._key_type: type[K] = key_type if key_type is not None else str  # type: ignore[assignment]
-
-    def _encode_key(self, key: K) -> str:
-        # str.__str__, not str(key): a str subclass (e.g. a str Enum) can override __str__ to
-        # return something other than its own value ("Room.LOBBY" instead of "lobby") — nats-py
-        # builds the wire subject via string formatting, so that override would leak onto the wire.
-        return str.__str__(key) if isinstance(key, str) else str(key)
-
-    def _decode_key(self, key: str) -> K:
-        return msgspec.convert(key, type=self._key_type, strict=False)
-
-    async def get(self, key: K, default: Optional[V] = None) -> Optional[V]:
-        """Return value stored under `key`, or `default` when there is none"""
-        try:
-            entry = await self.kv.get(self._encode_key(key))
-        except js_errors.KeyNotFoundError:
-            return default
-        if entry.value is None:
-            return default
-        return self._decoder.decode(entry.value)
-
-    async def get_entry(self, key: K) -> Optional[BucketEntry[V]]:
-        """Return `key`'s value together with its revision, or None when there is none
-
-        Use this instead of `get()` when you intend to `update()` the value
-        afterwards — `update()` needs the revision to detect a concurrent change.
-        """
-        try:
-            entry = await self.kv.get(self._encode_key(key))
-        except js_errors.KeyNotFoundError:
-            return None
-        if entry.value is None:
-            return None
-        assert entry.revision is not None  # noqa: S101 - always set on a real entry, narrows for mypy
-        return BucketEntry(value=self._decoder.decode(entry.value), revision=entry.revision)
-
-    async def put(self, key: K, value: V) -> int:
-        """Store `value` under `key` and return the new revision"""
-        return await self.kv.put(self._encode_key(key), _encoder.encode(value))
-
-    async def update(self, key: K, entry: BucketEntry[V]) -> int:
-        """Store `entry.value` under `key`, but only if it's still at `entry.revision`; return the new revision
-
-        `entry` is normally the one you got from `get_entry()`, its `value`
-        mutated in place — that's what couples the write to the read it's
-        based on. Raises nats-py's `KeyWrongLastSequenceError` if `key` was
-        changed by someone else since `entry.revision` was read — call
-        `get_entry()` again and retry your change against the fresh value.
-        """
-        return await self.kv.update(self._encode_key(key), _encoder.encode(entry.value), last=entry.revision)
-
-    async def delete(self, key: K) -> None:
-        """Remove `key` from the bucket"""
-        await self.kv.delete(self._encode_key(key))
-
-    async def keys(self) -> list[K]:
-        """List keys in the bucket"""
-        try:
-            raw_keys = await self.kv.keys()
-        except js_errors.NoKeysError:
-            return []
-        return [self._decode_key(key) for key in raw_keys]
-
-    async def watch(
-        self,
-        keys: str = ">",
-        *,
-        include_history: bool = False,
-    ) -> AsyncIterator[tuple[K, Optional[V], int]]:
-        """Async-iterate over `(key, value, revision)` for every change matching `keys`
-
-        `keys` is a raw NATS subject pattern (e.g. `"user.*"`), not a `K` — it
-        may contain wildcards, which a single key never does. `value` is None
-        when the change is a deletion. Runs until the caller stops iterating
-        (e.g. its task is cancelled) or the server closes the watch
-        subscription; either way, the underlying watcher is stopped properly
-        before this returns.
-        """
-        watcher = await self.kv.watch(keys, include_history=include_history)
-        try:
-            async for entry in watcher:
-                if entry is None:  # internal marker: history replay caught up, not a real change
-                    continue
-                # a deletion carries operation="DEL" with an *empty* (not None) value
-                value = self._decoder.decode(entry.value) if entry.value else None
-                yield self._decode_key(entry.key), value, entry.revision
-        finally:
-            await watcher.stop()
-
-
-async def _invoke(handler: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-    """Call handler, awaiting it when it is a coroutine function"""
-    result = handler(*args, **kwargs)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
-
-
-def _log_call(method: str, args: Sequence[Any], kwargs: dict[str, Any]) -> str:
-    """Format RPC call for logging, truncating large arguments"""
-    formatted = [_repr.repr(arg) for arg in args]
-    formatted.extend(f"{key}={_repr.repr(value)}" for key, value in kwargs.items())
-    return f"{method}({', '.join(formatted)})"
-
-
-def _parse_rpc_request(payload: bytes) -> tuple[list[Any], dict[str, Any]]:
-    """Decode `[args, kwargs]` RPC request payload"""
-    try:
-        data = _decoder.decode(payload)
-    except msgspec.DecodeError as error:
-        msg = f"Invalid RPC request, payload is not JSON: {error}"
-        raise RpcError(msg) from error
-    if not isinstance(data, list) or len(data) != 2:  # noqa: PLR2004
-        msg = "Invalid RPC request, payload must be [args, kwargs]"
-        raise RpcError(msg)
-    args, kwargs = data
-    if not isinstance(args, list):
-        msg = "Invalid RPC request, args must be a list"
-        raise RpcError(msg)
-    if not isinstance(kwargs, dict):
-        msg = "Invalid RPC request, kwargs must be an object"
-        raise RpcError(msg)
-    return args, kwargs
-
-
-class _RpcProxy:
-    """Turn `nats.rpc.ami.originate(...)` into `nats.call("ami.originate", ...)`"""
-
-    __slots__ = ("_nats", "_path")
-
-    def __init__(self, nats: "Nats", path: tuple[str, ...]) -> None:
-        self._nats = nats
-        self._path = path
-
-    def __getattr__(self, name: str) -> "_RpcProxy":
-        if name.startswith("__"):  # don't pretend to implement protocols like __await__
-            raise AttributeError(name)
-        return _RpcProxy(self._nats, (*self._path, name))
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:  # noqa: ANN401
-        return self._nats.call(".".join(self._path), args, kwargs)
-
-
-class _Consumer:
-    """Workers pulling messages of one durable JetStream consumer"""
-
-    def __init__(
-        self,
-        psub: JetStreamContext.PullSubscription,
-        handler: EventHandler,
-        durable: str,
-        ack_wait: float,
-    ) -> None:
-        self.psub = psub
-        self.handler = handler
-        self.durable = durable
-        self.ack_wait = ack_wait
-        self.stopping = False
-        self.workers: list[asyncio.Task] = []
-        self.idle: set[asyncio.Task] = set()  # workers waiting in fetch(), safe to cancel
-
-    def start(self, concurrency: int) -> None:
-        self.workers = [create_task(self._work(), f"Consumer[{self.durable}]#{i}") for i in range(concurrency)]
-
-    async def stop(self) -> None:
-        """Let workers finish messages they are processing, then unsubscribe"""
-        self.stopping = True
-        for task in self.idle:
-            task.cancel()
-        await asyncio.gather(*self.workers, return_exceptions=True)
-        with suppress(Exception):
-            await self.psub.unsubscribe()
-
-    async def _work(self) -> None:
-        task = asyncio.current_task()
-        if task is None:  # can't happen, we always run inside a task created by start()
-            msg = "Consumer worker must run inside a task"
-            raise RuntimeError(msg)
-        while not self.stopping:
-            self.idle.add(task)
-            try:
-                msgs = await self.psub.fetch(1, timeout=_FETCH_TIMEOUT)
-            except NatsTimeoutError:
-                continue
-            except ConnectionClosedError:
-                return
-            except Exception:  # noqa: BLE001 - keep the worker alive, JetStream may recover
-                log.trace("Fetching messages for consumer %s failed", self.durable)
-                await asyncio.sleep(_FETCH_RETRY_DELAY)
-                continue
-            finally:
-                self.idle.discard(task)
-
-            for message in msgs:
-                try:
-                    await self._process(message)
-                except Exception:  # noqa: BLE001 - e.g. ack failed because connection dropped
-                    log.trace("Processing message %s by consumer %s failed", message.subject, self.durable)
-
-    async def _process(self, msg: Msg) -> None:
-        try:
-            data = _decoder.decode(msg.data)
-        except msgspec.DecodeError:
-            # redelivery can't fix a malformed message, drop it for good
-            log.error("Consumer %s got invalid JSON on %s, terminating: %r", self.durable, msg.subject, msg.data[:200])
-            await msg.term()
-            return
-
-        log.debug("Consumer %s processing %s", self.durable, msg.subject)
-        keepalive = create_task(self._keepalive(msg), f"Keepalive[{msg.subject}]")
-        # let the keepalive task start, cancelling it before its first step would leave its coroutine never awaited
-        await asyncio.sleep(0)
-        try:
-            await _invoke(self.handler, msg.subject, data)
-            succeeded = True
-        except Exception:  # noqa: BLE001 - NAK so another consumer retries it right away
-            log.trace("Consumer %s failed to handle %s", self.durable, msg.subject)
-            succeeded = False
-        finally:
-            keepalive.cancel()
-
-        await (msg.ack() if succeeded else msg.nak())
-
-    async def _keepalive(self, msg: Msg) -> None:
-        """Keep a long running message assigned to us instead of letting ack_wait redeliver it"""
-        while True:
-            await asyncio.sleep(self.ack_wait / 2)
-            try:
-                await msg.in_progress()
-            except Exception as error:  # noqa: BLE001 - connection trouble is reported by Nats already
-                log.warning("Can't extend ack_wait of %s for consumer %s: %s", msg.subject, self.durable, error)
-                return
 
 
 class Nats:
@@ -349,7 +71,7 @@ class Nats:
         service_name: str,
         config: NatsConfig,
         *,
-        location: Optional[str] = None,
+        location: str | None = None,
         rpc_timeout: float = 2.0,
     ) -> None:
         self._service_name: str = service_name
@@ -358,11 +80,13 @@ class Nats:
         self._rpc_timeout: float = rpc_timeout
         self._client: Client = Client()
         self._js: JetStreamContext = self._client.jetstream()
-        self._subscriptions: dict[str, Subscription] = {}
+        self._subscriptions: dict[tuple[str, str], EventSubscription] = {}  # by (subject, queue)
+        self._subscribe_lock = asyncio.Lock()  # serializes subscribe()/unsubscribe(), each of them awaits the server
+        self._events: EventQueue = EventQueue()
         self._rpc_subscriptions: dict[str, Subscription] = {}
-        self._rpc_tasks: set[asyncio.Task] = set()
-        self._consumers: dict[str, _Consumer] = {}
-        self._buckets: dict[str, Bucket] = {}
+        self._rpc_tasks: set[asyncio.Task[None]] = set()
+        self._consumers: dict[str, Consumer] = {}
+        self._buckets: dict[str, Bucket[Any, Any]] = {}
         self._closing: bool = False
 
     @property
@@ -380,12 +104,18 @@ class Nats:
         return self._client.is_connected
 
     @property
-    def rpc(self) -> _RpcProxy:
+    def rpc(self) -> RpcProxy:
         """Call RPC methods as attributes: `await nats.rpc.ami.originate(ext, number=n)`"""
-        return _RpcProxy(self, ())
+        return RpcProxy(self, ())
 
     async def connect(self) -> None:
-        """Connect to NATS server and disconnect gracefully on shutdown"""
+        """Connect to NATS server and disconnect gracefully on shutdown
+
+        May be called again after `disconnect()`.
+        """
+        if self._events.started:
+            msg = "Already connected to NATS"
+            raise RuntimeError(msg)
         log.info("Connecting to NATS as %s at %s", self._connection_name, ", ".join(self._servers))
         await self._client.connect(
             servers=self._servers,
@@ -396,6 +126,8 @@ class Nats:
             disconnected_cb=self._on_disconnected,
             reconnected_cb=self._on_reconnected,
         )
+        self._closing = False
+        self._events.start()
         on_shutdown(self.disconnect)
         log.info("Connected to NATS as %s", self._connection_name)
 
@@ -404,8 +136,9 @@ class Nats:
 
         Consumers finish messages they are processing, RPC handlers already running
         get to reply, and pending event messages are delivered before closing.
+        Does nothing when not connected.
         """
-        if self._client.is_closed:
+        if self._client.is_closed or not self._events.started:
             return
 
         log.info("Disconnecting from NATS as %s", self._connection_name)
@@ -420,7 +153,14 @@ class Nats:
             await asyncio.gather(*self._rpc_tasks, return_exceptions=True)
         self._subscriptions.clear()
         await self._client.drain()
+        self._events.stop()
         log.info("Disconnected from NATS as %s", self._connection_name)
+
+    def _check_connected(self) -> None:
+        """Raise right away, subscribing before connect() would fail later in a confusing way"""
+        if not self._events.started:
+            msg = "Not connected to NATS"
+            raise RuntimeError(msg)
 
     async def _on_error(self, error: Exception) -> None:
         log.error("NATS connection error: %s", error)
@@ -434,48 +174,52 @@ class Nats:
 
     # --- events ---
 
-    async def publish(self, subject: str, data: Any) -> None:  # noqa: ANN401
+    async def publish(self, subject: str, data: Any, *, headers: dict[str, str] | None = None) -> None:  # noqa: ANN401
         """Publish event, `bytes` are sent as they are, anything else is encoded as JSON"""
-        payload = data if isinstance(data, bytes) else _encoder.encode(data)
-        await self._client.publish(subject, payload)
+        payload = data if isinstance(data, bytes) else encoder.encode(data)
+        await self._client.publish(subject, payload, headers=headers)
 
     async def subscribe(
         self,
         subject: str,
         handler: EventHandler,
         *,
-        queue: Optional[str] = None,
+        queue: str | None = None,
         raw: bool = False,
     ) -> None:
         """Call `handler(subject, data)` for every event on `subject`
 
-        `subject` may contain wildcards (`*`, `>`). Events of one subscription are
-        handled one by one in the order they arrived. With `queue`, every event is
-        delivered to only one subscriber of that queue group. With `raw`, `data` is
-        the undecoded payload bytes — use it to forward messages without the cost
-        of parsing them.
+        `subject` may contain wildcards (`*`, `>`). Events of all subscriptions are
+        handled one by one in the order they arrived, so a handler awaiting slow I/O
+        delays the others — start a task from it for such work. With `queue`, every
+        event is delivered to only one subscriber of that queue group. With `raw`,
+        `data` is the undecoded payload bytes — use it to forward messages without
+        the cost of parsing them. A handler having a `headers` parameter (or `**kwargs`)
+        also gets the event's NATS headers as `headers=` keyword argument.
+
+        Several handlers may subscribe to the same subject, they share one NATS
+        subscription and are called in the order they subscribed. The handler
+        identifies the subscription for `unsubscribe()`.
         """
-        if subject in self._subscriptions:
-            msg = f'Already subscribed to "{subject}"'
-            raise ValueError(msg)
-
-        async def on_message(msg: Msg) -> None:
-            if raw:
-                data: Any = msg.data
-            else:
-                try:
-                    data = _decoder.decode(msg.data)
-                except msgspec.DecodeError:
-                    log.warning("Invalid JSON event on %s: %r", msg.subject, msg.data[:200])
-                    return
-            try:
-                await _invoke(handler, msg.subject, data)
-            except Exception:  # noqa: BLE001 - one bad event must not kill the subscription
-                log.trace('Error handling NATS event "%s"', msg.subject)
-
-        self._subscriptions[subject] = await self._client.subscribe(subject, queue=queue or "", cb=on_message)
-        await self._sync_subscriptions()
-        log.debug("Subscribed to NATS subject %s", subject)
+        self._check_connected()
+        key = (subject, queue or "")
+        options = HandlerOptions(raw=raw, with_headers=wants_headers(handler))
+        async with self._subscribe_lock:
+            entry = self._subscriptions.get(key)
+            if entry is not None and handler in entry.handlers:
+                msg = f'{handler!r} is already subscribed to "{subject}"'
+                raise ValueError(msg)
+            if entry is not None:
+                entry.handlers[handler] = options
+                return
+            # without callback nats-py starts no task of its own, the shared event queue handles the messages
+            subscription = await self._client.subscribe(subject, queue=queue or "")
+            entry = EventSubscription(subscription)
+            entry.handlers[handler] = options
+            self._events.add(subscription, entry.on_message)
+            self._subscriptions[key] = entry
+            await self._sync_subscriptions()
+            log.debug("Subscribed to NATS subject %s", subject)
 
     async def _sync_subscriptions(self) -> None:
         """Make sure the server registered all subscriptions made so far
@@ -487,18 +231,30 @@ class Nats:
         await self._client.flush()
         await self._client.flush()
 
-    async def unsubscribe(self, subject: str) -> None:
-        """Stop receiving events subscribed by `subscribe(subject, ...)`"""
-        subscription = self._subscriptions.pop(subject, None)
-        if subscription is None:
-            log.warning('Not subscribed to NATS subject "%s"', subject)
+    async def unsubscribe(self, subject: str, handler: EventHandler, *, queue: str | None = None) -> None:
+        """Stop calling `handler` subscribed by `subscribe(subject, handler, queue=queue)`
+
+        The NATS subscription is removed with its last handler. Does nothing after
+        `disconnect()`, closing the connection removed all subscriptions already.
+        """
+        if self._client.is_closed:
             return
-        await subscription.unsubscribe()
-        log.debug("Unsubscribed from NATS subject %s", subject)
+        key = (subject, queue or "")
+        async with self._subscribe_lock:
+            entry = self._subscriptions.get(key)
+            if entry is None or entry.handlers.pop(handler, None) is None:
+                log.warning('%r is not subscribed to NATS subject "%s"', handler, subject)
+                return
+            if entry.handlers:
+                return
+            del self._subscriptions[key]
+            self._events.remove(entry.subscription)
+            await entry.subscription.unsubscribe()
+            log.debug("Unsubscribed from NATS subject %s", subject)
 
     # --- RPC ---
 
-    async def request(self, subject: str, payload: bytes, *, timeout: Optional[float] = None) -> bytes:
+    async def request(self, subject: str, payload: bytes, *, timeout: float | None = None) -> bytes:
         """Send raw request and return raw reply payload"""
         msg = await self._client.request(subject, payload, timeout=self._rpc_timeout if timeout is None else timeout)
         return msg.data
@@ -507,22 +263,19 @@ class Nats:
         self,
         method: str,
         args: Sequence[Any] = (),
-        kwargs: Optional[dict[str, Any]] = None,
+        kwargs: dict[str, Any] | None = None,
         *,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
     ) -> Any:  # noqa: ANN401
         """Call RPC `method` served by some service via `serve()` and return its result
 
-        Raises `RpcError` when the remote handler failed, and nats-py's
-        `NoRespondersError`/`TimeoutError` when nobody serves the method or it
-        didn't reply within `timeout` (default is `rpc_timeout` of the constructor).
+        Raises `RpcError` when the remote handler failed or its reply isn't in the
+        RPC wire format, and nats-py's `NoRespondersError`/`TimeoutError` when
+        nobody serves the method or it didn't reply within `timeout` (default is
+        `rpc_timeout` of the constructor).
         """
-        payload = _encoder.encode((args, kwargs or {}))
-        reply = await self.request(_RPC_PREFIX + method, payload, timeout=timeout)
-        status, result = _decoder.decode(reply)
-        if status != _RPC_OK:
-            raise RpcError(result, code=status)
-        return result
+        payload = encoder.encode((args, kwargs or {}))
+        return parse_reply(await self.request(RPC_PREFIX + method, payload, timeout=timeout))
 
     async def serve(self, method: str, handler: RpcHandler) -> None:
         """Handle RPC calls of `method` by `handler(*args, **kwargs)`
@@ -531,7 +284,8 @@ class Nats:
         concurrently. All instances of this service share a queue group, so each call
         is handled by exactly one of them.
         """
-        subject = _RPC_PREFIX + method
+        self._check_connected()
+        subject = RPC_PREFIX + method
         if subject in self._rpc_subscriptions:
             msg = f'RPC method "{method}" is already served'
             raise ValueError(msg)
@@ -549,15 +303,15 @@ class Nats:
 
     async def _handle_rpc(self, msg: Msg, method: str, handler: RpcHandler) -> None:
         try:
-            args, kwargs = _parse_rpc_request(msg.data)
+            args, kwargs = parse_request(msg.data)
         except RpcError as error:
             log.warning("%s: %s", method, error.message)
             await self._reply(msg, error.code, error.message)
             return
 
-        call = _log_call(method, args, kwargs)
+        call = log_call(method, args, kwargs)
         try:
-            result = await _invoke(handler, *args, **kwargs)
+            result = await invoke(handler, *args, **kwargs)
         except RpcError as error:
             log.warning("%s -> RpcError(%s)", call, error.message)
             await self._reply(msg, error.code, error.message)
@@ -568,15 +322,15 @@ class Nats:
             await self._reply(msg, 0, "Internal error")
             return
 
-        log.debug("%s -> %s", call, _repr.repr(result))
-        await self._reply(msg, _RPC_OK, result)
+        log.debug("%s -> %s", call, short_repr(result))
+        await self._reply(msg, RPC_OK, result)
 
     async def _reply(self, msg: Msg, code: int, result: Any) -> None:  # noqa: ANN401
         try:
-            payload = _encoder.encode((code, result))
+            payload = encoder.encode((code, result))
         except TypeError:
             log.trace("RPC %s returned value that can't be encoded to JSON", msg.subject)
-            payload = _encoder.encode((0, "Internal error"))
+            payload = encoder.encode((0, "Internal error"))
         await msg.respond(payload)
 
     # --- JetStream ---
@@ -593,7 +347,8 @@ class Nats:
         """Process JetStream messages on `subject` by `handler(subject, data)`
 
         Uses a durable consumer, so messages published while the service is down are
-        processed once it's back.
+        processed once it's back. Like in `subscribe()`, a handler having a `headers`
+        parameter also gets the message's NATS headers.
 
         :param per_server: When True, every server running this service processes
             each message. When False, each message is processed by only one of them.
@@ -603,6 +358,7 @@ class Nats:
             alive automatically. When the handler raises, the message is NAKed and
             redelivered immediately.
         """
+        self._check_connected()
         if subject in self._consumers:
             msg = f'Already consuming "{subject}"'
             raise ValueError(msg)
@@ -617,13 +373,18 @@ class Nats:
                 log.info("Recreating consumer %s because its configuration changed", durable)
 
         psub = await self._js.pull_subscribe(subject, durable, stream=stream, config=ConsumerConfig(ack_wait=ack_wait))
-        consumer = _Consumer(psub, handler, durable, ack_wait)
+        consumer = Consumer(psub, handler, durable, ack_wait)
         self._consumers[subject] = consumer
         consumer.start(concurrency)
         log.info("Consumer %s processing %s from stream %s", durable, subject, stream)
 
     async def stop_consumer(self, subject: str) -> None:
-        """Stop consuming `subject`, letting messages being processed finish"""
+        """Stop consuming `subject`, letting messages being processed finish
+
+        Does nothing after `disconnect()`, it stopped all consumers already.
+        """
+        if self._client.is_closed:
+            return
         consumer = self._consumers.pop(subject, None)
         if consumer is None:
             log.warning('Not consuming "%s"', subject)
@@ -636,22 +397,22 @@ class Nats:
     # to Never, rejecting every get()/put() call on the result) — the real
     # signature right below is what actually runs.
     @overload
-    async def bucket(self, name: str, *, create: bool = True) -> "Bucket[str, Any]": ...
+    async def bucket(self, name: str, *, create: bool = True) -> Bucket[str, Any]: ...
     @overload
-    async def bucket(self, name: str, *, value_type: type[V], create: bool = True) -> "Bucket[str, V]": ...
+    async def bucket(self, name: str, *, value_type: type[V], create: bool = True) -> Bucket[str, V]: ...
     @overload
-    async def bucket(self, name: str, *, key_type: type[K], create: bool = True) -> "Bucket[K, Any]": ...
+    async def bucket(self, name: str, *, key_type: type[K], create: bool = True) -> Bucket[K, Any]: ...
     @overload
     async def bucket(
         self, name: str, *, value_type: type[V], key_type: type[K], create: bool = True,
-    ) -> "Bucket[K, V]": ...
+    ) -> Bucket[K, V]: ...
 
     async def bucket(
         self,
         name: str,
         *,
-        value_type: Optional[type[V]] = None,
-        key_type: Optional[type[K]] = None,
+        value_type: type[V] | None = None,
+        key_type: type[K] | None = None,
         create: bool = True,
     ) -> Bucket[K, V]:
         """Return key-value bucket `name`, creating it when it doesn't exist and `create` is True
@@ -662,6 +423,7 @@ class Nats:
         bare `str`. Both are only used the first time this bucket is opened —
         later calls for the same `name` return the cached instance as-is.
         """
+        self._check_connected()
         bucket = self._buckets.get(name)
         if bucket is not None:
             return bucket

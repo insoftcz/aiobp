@@ -1,15 +1,16 @@
 """Integration tests for aiobp.nats against a real nats-server"""
 
 import asyncio
+import functools
 import importlib
 import logging
 import shutil
 import socket
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 import msgspec
@@ -20,9 +21,9 @@ from nats.js import errors as js_errors
 
 from aiobp.nats import Bucket, BucketEntry, Nats, NatsConfig, RpcError
 
-NATS_SERVER = shutil.which("nats-server")
 # the aiobp package re-exports the runner() function under the module's name
 _runner_module = importlib.import_module("aiobp.runner")
+_common_module = importlib.import_module("aiobp.nats._common")
 
 NatsFactory = Callable[..., Awaitable[Nats]]
 
@@ -32,15 +33,9 @@ class Item(msgspec.Struct):
     price: float
 
 
-class Room(str, Enum):
+class Room(str, Enum):  # noqa: UP042 - tests a str Enum whose str() isn't its value
     LOBBY = "lobby"
     KITCHEN = "kitchen"
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def unique(prefix: str) -> str:
@@ -48,13 +43,13 @@ def unique(prefix: str) -> str:
     return f"{prefix}{uuid4().hex[:8]}"
 
 
-async def wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not predicate():
-        if time.monotonic() > deadline:
-            msg = "Condition not met in time"
-            raise AssertionError(msg)
-        await asyncio.sleep(0.01)
+NATS_SERVER = shutil.which("nats-server")
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 @pytest.fixture(scope="module")
@@ -84,6 +79,15 @@ def nats_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 
     process.terminate()
     process.wait(timeout=5)
+
+
+async def wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            msg = "Condition not met in time"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.01)
 
 
 @pytest.fixture
@@ -134,6 +138,26 @@ class TestConnection:
         nats = Nats("svc", NatsConfig(url="nats://a:4222, nats://b:4222"))
         assert nats._servers == ["nats://a:4222", "nats://b:4222"]  # noqa: SLF001
 
+    def test_created_without_running_loop(self, nats_url: str) -> None:
+        # e.g. at module level of a service, before runner() starts the loop
+        subscriber, publisher = Nats("svc-a", NatsConfig(url=nats_url)), Nats("svc-b", NatsConfig(url=nats_url))
+        subject = unique("ev.")
+        received: list[Any] = []
+
+        async def main() -> None:
+            await subscriber.connect()
+            await publisher.connect()
+            await subscriber.subscribe(subject, lambda _s, d: received.append(d))
+            await publisher.publish(subject, 1)
+            await wait_until(lambda: received == [1])
+            await publisher.disconnect()
+            await subscriber.disconnect()
+
+        try:
+            asyncio.run(main())
+        finally:
+            getattr(_runner_module, "__on_shutdown").clear()
+
     async def test_connected_property(self, nats_url: str) -> None:
         nats = Nats("svc", NatsConfig(url=nats_url))
         assert not nats.connected
@@ -157,6 +181,39 @@ class TestConnection:
         await nats.disconnect()
         await nats.disconnect()
         assert nats.client.is_closed
+
+    async def test_cleanup_after_disconnect_is_silent(
+        self, make_nats: NatsFactory, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Tasks are cancelled after the runner disconnected NATS, their cleanup must not fail"""
+        nats = await make_nats()
+        prefix = await add_stream(nats)
+
+        def handler(_subject: str, _data: Any) -> None:  # noqa: ANN401
+            pass
+
+        await nats.subscribe("ev.cleanup", handler)
+        await nats.consume(f"{prefix}.x", handler)
+        await nats.disconnect()
+        with caplog.at_level(logging.WARNING):
+            await nats.unsubscribe("ev.cleanup", handler)
+            await nats.stop_consumer(f"{prefix}.x")
+        assert caplog.text == ""
+
+    async def test_connect_twice_raises(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        with pytest.raises(RuntimeError, match="Already connected"):
+            await nats.connect()
+
+    async def test_reconnect_after_disconnect(self, make_nats: NatsFactory) -> None:
+        nats, publisher = await make_nats(), await make_nats("pub")
+        await nats.disconnect()
+        await nats.connect()
+        subject = unique("ev.")
+        received: list[Any] = []
+        await nats.subscribe(subject, lambda _s, d: received.append(d))
+        await publisher.publish(subject, 1)
+        await wait_until(lambda: received == [1])
 
     async def test_intentional_disconnect_doesnt_warn_about_reconnecting(
         self, make_nats: NatsFactory, caplog: pytest.LogCaptureFixture,
@@ -182,6 +239,44 @@ class TestEvents:
         await a.publish(subject, {"x": 1})
         await wait_until(lambda: len(received) == 1)
         assert received == [(subject, {"x": 1})]
+
+    async def test_headers_are_passed_to_handler(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("ev.")
+        received: list[dict[str, str]] = []
+        await b.subscribe(subject, lambda _s, _d, headers: received.append(headers))
+        await a.publish(subject, 1, headers={"X-Groups": "[1, 8]"})
+        await a.publish(subject, 2)
+        await wait_until(lambda: len(received) == 2)
+        assert received == [{"X-Groups": "[1, 8]"}, {}]
+
+    async def test_headers_only_for_handlers_asking_for_them(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("ev.")
+        received: list[tuple[str, Any]] = []
+
+        def plain(_subject: str, data: Any) -> None:  # noqa: ANN401
+            received.append(("plain", data))
+
+        async def keyword_only(_subject: str, _data: Any, *, headers: dict[str, str]) -> None:  # noqa: ANN401
+            received.append(("keyword_only", headers))
+
+        def optional(_subject: str, _data: Any, headers: dict[str, str] | None = None) -> None:  # noqa: ANN401
+            received.append(("optional", headers))
+
+        def kwargs(_subject: str, _data: Any, **kw: Any) -> None:  # noqa: ANN401
+            received.append(("kwargs", kw))
+
+        for handler in (plain, keyword_only, optional, kwargs):
+            await b.subscribe(subject, handler)
+        await a.publish(subject, 1, headers={"X-Groups": "[1]"})
+        await wait_until(lambda: len(received) == 4)
+        assert received == [
+            ("plain", 1),
+            ("keyword_only", {"X-Groups": "[1]"}),
+            ("optional", {"X-Groups": "[1]"}),
+            ("kwargs", {"headers": {"X-Groups": "[1]"}}),
+        ]
 
     async def test_async_handler(self, pair: tuple[Nats, Nats]) -> None:
         a, b = pair
@@ -237,6 +332,78 @@ class TestEvents:
         await wait_until(lambda: len(received) == 100)
         assert received == list(range(100))
 
+    async def test_events_keep_order_across_subscriptions(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        prefix = unique("call")
+        received: list[tuple[str, int]] = []
+
+        async def slow(subject: str, data: int) -> None:
+            await asyncio.sleep(0.001)  # events of the other subscriptions must not overtake
+            received.append((subject.rsplit(".", 1)[-1], data))
+
+        async def fast(subject: str, data: int) -> None:
+            received.append((subject.rsplit(".", 1)[-1], data))
+
+        await b.subscribe(f"{prefix}.new", slow)
+        await b.subscribe(f"{prefix}.answer", fast)
+        await b.subscribe(f"{prefix}.hangup", lambda s, d: received.append((s.rsplit(".", 1)[-1], d)))
+        expected = [(event, i) for i in range(30) for event in ("new", "answer", "hangup")]
+        for event, i in expected:
+            await a.publish(f"{prefix}.{event}", i)
+        await wait_until(lambda: len(received) == len(expected))
+        assert received == expected
+
+    async def test_unsubscribe_keeps_other_subscriptions(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        prefix = unique("ev")
+        received: list[str] = []
+
+        def handler(subject: str, _data: Any) -> None:  # noqa: ANN401
+            received.append(subject)
+
+        await b.subscribe(f"{prefix}.one", handler)
+        await b.subscribe(f"{prefix}.two", handler)
+        await b.unsubscribe(f"{prefix}.one", handler)
+        await a.publish(f"{prefix}.one", 1)
+        await a.publish(f"{prefix}.two", 2)
+        await wait_until(lambda: received == [f"{prefix}.two"])
+        await asyncio.sleep(0.1)
+        assert received == [f"{prefix}.two"]
+
+    async def test_handler_exception_doesnt_affect_other_subscriptions(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        prefix = unique("ev")
+        received: list[int] = []
+
+        def handler(_subject: str, data: int) -> None:
+            if data == 1:
+                msg = "boom"
+                raise ValueError(msg)
+            received.append(data)
+
+        await b.subscribe(f"{prefix}.one", handler)
+        await b.subscribe(f"{prefix}.two", handler)
+        for i in range(4):
+            await a.publish(f"{prefix}.{'one' if i % 2 else 'two'}", i)
+        await wait_until(lambda: received == [0, 2, 3])
+
+    async def test_pending_events_are_handled_on_disconnect(self, make_nats: NatsFactory) -> None:
+        a, b = await make_nats("svc-a"), await make_nats("svc-b")
+        subject = unique("ev.")
+        received: list[int] = []
+
+        async def handler(_subject: str, data: int) -> None:
+            await asyncio.sleep(0.001)
+            received.append(data)
+
+        await b.subscribe(subject, handler)
+        for i in range(20):
+            await a.publish(subject, i)
+        await a.client.flush()
+        await wait_until(lambda: len(received) > 0)
+        await b.disconnect()
+        assert received == list(range(20))
+
     async def test_handler_exception_doesnt_kill_subscription(self, pair: tuple[Nats, Nats]) -> None:
         a, b = pair
         subject = unique("ev.")
@@ -262,30 +429,138 @@ class TestEvents:
         await a.publish(subject, {"ok": True})
         await wait_until(lambda: received == [{"ok": True}])
 
-    async def test_duplicate_subscribe_raises(self, make_nats: NatsFactory) -> None:
+    async def test_same_handler_twice_raises(self, make_nats: NatsFactory) -> None:
         nats = await make_nats()
         subject = unique("ev.")
-        await nats.subscribe(subject, lambda _s, _d: None)
-        with pytest.raises(ValueError, match="Already subscribed"):
-            await nats.subscribe(subject, lambda _s, _d: None)
+
+        def handler(_subject: str, _data: Any) -> None:  # noqa: ANN401
+            pass
+
+        await nats.subscribe(subject, handler)
+        with pytest.raises(ValueError, match="already subscribed"):
+            await nats.subscribe(subject, handler)
+        await nats.subscribe(subject, handler, queue="w")  # another queue group is another subscription
 
     async def test_unsubscribe_stops_delivery(self, pair: tuple[Nats, Nats]) -> None:
         a, b = pair
         subject = unique("ev.")
         received: list[Any] = []
-        await b.subscribe(subject, lambda _s, d: received.append(d))
-        await b.unsubscribe(subject)
+
+        def handler(_subject: str, data: Any) -> None:  # noqa: ANN401
+            received.append(data)
+
+        await b.subscribe(subject, handler)
+        await b.unsubscribe(subject, handler)
+        assert b.client._subs == {}  # noqa: SLF001 - NATS subscription removed with the last handler
         await a.publish(subject, 1)
         await a.client.flush()
         await asyncio.sleep(0.1)
         assert received == []
 
-    async def test_unsubscribe_unknown_subject_warns(
+    async def test_unsubscribe_unknown_handler_warns(
         self, make_nats: NatsFactory, caplog: pytest.LogCaptureFixture,
     ) -> None:
         nats = await make_nats()
-        await nats.unsubscribe("never.subscribed")
-        assert "Not subscribed" in caplog.text
+        subject = unique("ev.")
+
+        def handler(_subject: str, _data: Any) -> None:  # noqa: ANN401
+            pass
+
+        await nats.unsubscribe("never.subscribed", handler)
+        assert "is not subscribed" in caplog.text
+        caplog.clear()
+        await nats.subscribe(subject, handler)
+        await nats.unsubscribe(subject, lambda _s, _d: None)  # a different handler
+        assert "is not subscribed" in caplog.text
+
+    async def test_handlers_of_one_subject_share_subscription(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("ev.")
+        received: list[tuple[str, Any]] = []
+
+        async def first(_subject: str, data: Any) -> None:  # noqa: ANN401
+            await asyncio.sleep(0.001)  # the second handler must wait for the first one
+            received.append(("first", data))
+
+        def second(_subject: str, data: Any) -> None:  # noqa: ANN401
+            received.append(("second", data))
+
+        await b.subscribe(subject, first)
+        await b.subscribe(subject, second)
+        assert len(b.client._subs) == 1  # noqa: SLF001
+        for i in range(3):
+            await a.publish(subject, i)
+        await wait_until(lambda: len(received) == 6)
+        assert received == [(name, i) for i in range(3) for name in ("first", "second")]
+
+        await b.unsubscribe(subject, first)
+        await a.publish(subject, 3)
+        await wait_until(lambda: len(received) == 7)
+        await b.unsubscribe(subject, second)
+        assert b.client._subs == {}  # noqa: SLF001
+        assert received[-1] == ("second", 3)
+
+    async def test_raw_and_decoded_handlers_share_subscription(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("ev.")
+        raw: list[bytes] = []
+        decoded: list[Any] = []
+        await b.subscribe(subject, lambda _s, d: raw.append(d), raw=True)
+        await b.subscribe(subject, lambda _s, d: decoded.append(d))
+        await a.publish(subject, {"x": 1})
+        await a.publish(subject, b"not json")  # raw handler still gets it
+        await wait_until(lambda: len(raw) == 2)
+        assert raw == [b'{"x":1}', b"not json"]
+        assert decoded == [{"x": 1}]
+
+    async def test_handler_exception_doesnt_affect_other_handlers(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("ev.")
+        received: list[Any] = []
+
+        def failing(_subject: str, _data: Any) -> None:  # noqa: ANN401
+            msg = "boom"
+            raise ValueError(msg)
+
+        await b.subscribe(subject, failing)
+        await b.subscribe(subject, lambda _s, d: received.append(d))
+        await a.publish(subject, 1)
+        await wait_until(lambda: received == [1])
+
+    async def test_bound_method_unsubscribes(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        subject = unique("ev.")
+
+        class Component:
+            def __init__(self) -> None:
+                self.received: list[Any] = []
+
+            def on_event(self, _subject: str, data: Any) -> None:  # noqa: ANN401
+                self.received.append(data)
+
+        one, two = Component(), Component()
+        await b.subscribe(subject, one.on_event)
+        await b.subscribe(subject, two.on_event)  # same function, other instance — another handler
+        await b.unsubscribe(subject, one.on_event)  # a new bound method object, equal to the subscribed one
+        await a.publish(subject, 1)
+        await wait_until(lambda: two.received == [1])
+        assert one.received == []
+
+    async def test_subscribe_before_connect_raises(self) -> None:
+        nats = Nats("svc", NatsConfig())
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await nats.subscribe("x", lambda _s, _d: None)
+
+    @pytest.mark.parametrize("method", ["serve", "consume", "bucket"])
+    async def test_other_subscriptions_before_connect_raise(self, method: str) -> None:
+        nats = Nats("svc", NatsConfig())
+        call = {
+            "serve": lambda: nats.serve("x", lambda: None),
+            "consume": lambda: nats.consume("x", lambda _s, _d: None),
+            "bucket": lambda: nats.bucket("x"),
+        }[method]
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await call()
 
     async def test_queue_group_delivers_each_event_once(self, make_nats: NatsFactory) -> None:
         publisher, first, second = await make_nats("pub"), await make_nats("w1"), await make_nats("w2")
@@ -402,6 +677,20 @@ class TestRpc:
         with pytest.raises(NoRespondersError):
             await nats.call(unique("nobody.home"))
 
+    @pytest.mark.parametrize("reply", [b"not json", b"{}", b"[1]", b'["x", 1]'])
+    async def test_malformed_reply_raises_rpc_error(self, pair: tuple[Nats, Nats], reply: bytes) -> None:
+        a, b = pair
+        method = unique("calc.weird")
+
+        async def respond(msg: Any) -> None:  # noqa: ANN401
+            await msg.respond(reply)
+
+        await b.client.subscribe(f"rpc.{method}", cb=respond)
+        await b.client.flush()
+        await b.client.flush()
+        with pytest.raises(RpcError, match="Invalid RPC reply"):
+            await a.call(method)
+
     async def test_timeout(self, pair: tuple[Nats, Nats]) -> None:
         a, b = pair
         method = unique("calc.slow")
@@ -482,6 +771,14 @@ class TestRpc:
 
 
 class TestConsumers:
+
+    async def test_consumer_gets_headers(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        prefix = await add_stream(a)
+        received: list[dict[str, str]] = []
+        await b.consume(f"{prefix}.x", lambda _s, _d, headers: received.append(headers))
+        await a.jetstream.publish(f"{prefix}.x", b"1", headers={"X-Groups": "[1]"})
+        await wait_until(lambda: received == [{"X-Groups": "[1]"}])
 
     async def test_messages_are_processed_and_acked(self, pair: tuple[Nats, Nats]) -> None:
         a, b = pair
@@ -816,3 +1113,61 @@ class TestBucket:
         # the watcher's subscription must be gone, or a fresh watch() would see it linger
         await bucket.put("after-cancel", 1)
         assert await bucket.get("after-cancel") == 1
+
+    async def test_watch_cancelled_after_disconnect_raises_cancelled(self, make_nats: NatsFactory) -> None:
+        """The runner disconnects NATS before it cancels tasks, stopping the watcher then must not fail"""
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        started = asyncio.Event()
+
+        async def run() -> None:
+            started.set()
+            async for _event in bucket.watch():
+                pass
+
+        task = asyncio.create_task(run())
+        await asyncio.wait_for(started.wait(), timeout=3)
+        await asyncio.sleep(0.1)
+        await nats.disconnect()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+# ---------------------------------------------------------------------------
+# Event handler signature detection
+# ---------------------------------------------------------------------------
+
+
+def _plain(subject: str, data: Any) -> None: ...  # noqa: ANN401
+def _named(subject: str, data: Any, headers: dict[str, str]) -> None: ...  # noqa: ANN401
+def _other_name(subject: str, data: Any, hdrs: dict[str, str] | None = None) -> None: ...  # noqa: ANN401
+def _var_positional(subject: str, data: Any, *args: Any) -> None: ...  # noqa: ANN401
+def _var_keyword(subject: str, data: Any, **kwargs: Any) -> None: ...  # noqa: ANN401
+
+
+class _Handlers:
+    def method(self, subject: str, data: Any, *, headers: dict[str, str]) -> None: ...  # noqa: ANN401
+
+
+@pytest.mark.parametrize(
+    ("handler", "expected"),
+    [
+        (_plain, False),
+        (_named, True),
+        (_other_name, False),
+        (_var_positional, False),
+        (_var_keyword, True),
+        (_Handlers().method, True),
+        (functools.partial(_named, "x"), True),
+        (print, False),
+    ],
+)
+def test_wants_headers(handler: Any, expected: bool) -> None:  # noqa: ANN401, FBT001
+    assert _common_module.wants_headers(handler) is expected
+
+
+def test_unsupported_nats_py_internals_fail_loudly() -> None:
+    events_module = importlib.import_module("aiobp.nats._events")
+    with pytest.raises(RuntimeError, match="Unsupported nats-py version"):
+        events_module.EventQueue().add(object(), lambda _msg: None)

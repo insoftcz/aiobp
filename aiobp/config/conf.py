@@ -2,7 +2,7 @@
 
 from configparser import ConfigParser
 from dataclasses import dataclass, is_dataclass
-from typing import Annotated, Any, Optional, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
 
@@ -21,7 +21,7 @@ def parse_value(s: str, t: type) -> Any:  # noqa: ANN401
     return s
 
 
-def __retype(val: Any, composite_type: Optional[type]) -> Any:
+def __retype(val: Any, composite_type: type | None) -> Any:
     """Retype value to it's annotation"""
     if composite_type is None:
         return val
@@ -69,7 +69,7 @@ def __ini_typer(obj: Annotated, data: dict[Any, Any]) -> dict[Any, Any]:
     return result
 
 
-def loader(config_class: type[dataclass], filename: Optional[str] = None) -> Annotated:
+def loader(config_class: type[dataclass], filename: str | None = None) -> Annotated:
     """INI like configuration loader"""
     if filename is None:
         return msgspec.convert({}, type=config_class)

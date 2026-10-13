@@ -4,7 +4,7 @@ import inspect
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Optional, Union, final, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Union, final, get_args, get_origin, get_type_hints
 
 import msgspec
 from aiohttp import web
@@ -18,7 +18,7 @@ InjectorFactory = Callable[[web.Request], Any]
 ArgGetter = Callable[..., Any]
 
 
-class SourceKind(str, Enum):
+class SourceKind(str, Enum):  # noqa: UP042 - StrEnum would change str() and format() of members
     """Where a handler argument (or entire body) is resolved from."""
 
     PATH = "path"
@@ -75,8 +75,8 @@ class ApiError(web.HTTPException):
     def __init__(
         self,
         *args: Any,
-        headers: Optional[LooseHeaders] = None,
-        reason: Optional[str] = None,
+        headers: LooseHeaders | None = None,
+        reason: str | None = None,
         **kwargs: Any,
     ) -> None:
         # headers/reason are pulled out by name so they route to HTTPException (below)
@@ -110,9 +110,9 @@ class ArgumentError(TypeError):
     response body instead of a bare string.
     """
 
-    def __init__(self, attribute: str, source: Optional[SourceKind], error: str) -> None:
+    def __init__(self, attribute: str, source: SourceKind | None, error: str) -> None:
         self.attribute: str = attribute
-        self.source: Optional[SourceKind] = source
+        self.source: SourceKind | None = source
         self.error: str = error
         location = source.value if source is not None else "unknown"
         super().__init__(f"{attribute} ({location}): {error}")
@@ -122,7 +122,7 @@ class ArgumentValidationError(msgspec.Struct):
     """A single handler argument that failed to resolve or validate."""
 
     attribute: str
-    source: Optional[SourceKind]
+    source: SourceKind | None
     error: str
 
 
@@ -245,7 +245,7 @@ else:
     FromQuery = Source(SourceKind.QUERY_ITEMS)
 
 
-def Param(description: str, *, source: Optional[str] = None, example: Any = None, **kwargs: Any) -> Meta:  # noqa: N802
+def Param(description: str, *, source: str | None = None, example: Any = None, **kwargs: Any) -> Meta:  # noqa: N802
     """Build ``msgspec.Meta`` with the description as first positional argument.
 
     Usage::
@@ -356,11 +356,11 @@ class Provider:
         if errors:
             raise TypeError(errors)
 
-    def _sources_for(self, source: Optional[Source]) -> list[Callable[[str, web.Request], Optional[str]]]:
+    def _sources_for(self, source: Source | None) -> list[Callable[[str, web.Request], str | None]]:
         """Pick the getter(s) to try for a non-body argument, in order."""
         if source is None:
             return [self._get_from_path, self._get_from_query]
-        by_kind: dict[SourceKind, Callable[[str, web.Request], Optional[str]]] = {
+        by_kind: dict[SourceKind, Callable[[str, web.Request], str | None]] = {
             SourceKind.PATH: self._get_from_path,
             SourceKind.QUERY: self._get_from_query,
             SourceKind.HEADER: self._get_from_header,
@@ -369,7 +369,7 @@ class Provider:
         return [by_kind[source.kind]]
 
     @staticmethod
-    def _source_name(name: str, meta: Optional[Meta]) -> str:
+    def _source_name(name: str, meta: Meta | None) -> str:
         """Resolve the key used to look the value up, honouring ``Param(source=...)``."""
         if meta is not None and meta.extra:
             return meta.extra.get("source", name)
@@ -382,11 +382,11 @@ class Provider:
         *,
         optional: bool,
         default: Any,
-        sources: list[Callable[[str, web.Request], Optional[str]]],
+        sources: list[Callable[[str, web.Request], str | None]],
         request: web.Request,
-        meta: Optional[Meta] = None,
-        source_name: Optional[str] = None,
-        source_kind: Optional[SourceKind] = None,
+        meta: Meta | None = None,
+        source_name: str | None = None,
+        source_kind: SourceKind | None = None,
     ) -> Any:
         """Take value for one argument from source and validate it"""
         key = source_name or name
@@ -399,8 +399,8 @@ class Provider:
 
     @staticmethod
     def _format_value(  # noqa: PLR0913
-        name: str, typ: type, value: Any, *, optional: bool, default: Any, meta: Optional[Meta],
-        source: Optional[SourceKind] = None,
+        name: str, typ: type, value: Any, *, optional: bool, default: Any, meta: Meta | None,
+        source: SourceKind | None = None,
     ) -> Any:
         """Apply the default fallback, then validate/coerce a single raw value.
 
@@ -430,8 +430,8 @@ class Provider:
         *,
         optional: bool,
         default: Any,
-        meta: Optional[Meta],
-        source_name: Optional[str],
+        meta: Meta | None,
+        source_name: str | None,
         request: web.Request,
     ) -> Any:
         """Resolve a handler argument from a single named field in the request body."""
@@ -532,23 +532,23 @@ class Provider:
         return request.query
 
     @staticmethod
-    def _get_from_path(key: str, request: web.Request) -> Optional[str]:
+    def _get_from_path(key: str, request: web.Request) -> str | None:
         return request.match_info.get(key)
 
     @staticmethod
-    def _get_from_query(key: str, request: web.Request) -> Optional[str]:
+    def _get_from_query(key: str, request: web.Request) -> str | None:
         return request.query.get(key)
 
     @staticmethod
-    def _get_from_header(key: str, request: web.Request) -> Optional[str]:
+    def _get_from_header(key: str, request: web.Request) -> str | None:
         return request.headers.get(key)
 
     @staticmethod
-    def _get_from_cookie(key: str, request: web.Request) -> Optional[str]:
+    def _get_from_cookie(key: str, request: web.Request) -> str | None:
         return request.cookies.get(key)
 
     @staticmethod
-    def get_annotation(hint: Any) -> tuple[type, bool, Optional[Meta], Optional[Source]]:
+    def get_annotation(hint: Any) -> tuple[type, bool, Meta | None, Source | None]:
         """Parse Annotated[type, Meta?, Source?] with optional Optional wrapper.
 
         Returns (type, is_optional, meta_or_none, source_or_none).
@@ -576,7 +576,7 @@ class Provider:
 
         hint_type: Any = annotated_args[0]
         meta: Any = None
-        source: Optional[Source] = None
+        source: Source | None = None
 
         for arg in annotated_args[1:]:
             if isinstance(arg, Meta):
@@ -607,7 +607,7 @@ class Provider:
         return dict(args)
 
     def encode_response(
-        self, result: Any, content_type: Optional[str] = None, charset: str = "utf-8", status: int = 200,
+        self, result: Any, content_type: str | None = None, charset: str = "utf-8", status: int = 200,
     ) -> web.StreamResponse:
         if isinstance(result, web.StreamResponse):
             return result

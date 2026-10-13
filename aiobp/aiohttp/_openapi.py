@@ -3,7 +3,7 @@
 import inspect
 import re
 from collections.abc import Callable
-from typing import Annotated, Any, Optional, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 
 import msgspec
 from msgspec import Meta
@@ -39,7 +39,7 @@ def _path_param_names(path: str) -> set[str]:
     return set(_PATH_PARAM_RE.findall(path))
 
 
-def _split_docstring(doc: Optional[str]) -> tuple[str, str]:
+def _split_docstring(doc: str | None) -> tuple[str, str]:
     """Split a handler docstring into (summary, description).
 
     Dedents using the common indentation of the description lines (like
@@ -52,7 +52,7 @@ def _split_docstring(doc: Optional[str]) -> tuple[str, str]:
     return summary, rest.strip("\n")
 
 
-def _clean_description(doc: Optional[str]) -> str:
+def _clean_description(doc: str | None) -> str:
     """Dedent a docstring-derived description (e.g. from a msgspec Struct) into one string.
 
     JSON Schema's ``description`` has no separate summary/description split like an
@@ -65,7 +65,7 @@ def _clean_description(doc: Optional[str]) -> str:
     return f"**{summary}**\n___\n{description}"
 
 
-def _unwrap_return(annotation: Any) -> tuple[Any, Optional[str]]:
+def _unwrap_return(annotation: Any) -> tuple[Any, str | None]:
     """Split a return annotation into (type, description), unwrapping Annotated[type, Meta(...)]."""
     if get_origin(annotation) is not Annotated:
         return annotation, None
@@ -80,7 +80,7 @@ class OpenAPIBuilder:
     def __init__(self) -> None:
         self.title: str = "API"
         self.version: str = "0.0.0"
-        self.description: Optional[str] = None
+        self.description: str | None = None
         self._paths: dict[str, Any] = {}
         self._schemas: dict[str, Any] = {}
         self._security_schemes: dict[str, Any] = {}
@@ -99,7 +99,7 @@ class OpenAPIBuilder:
     def add_oauth2(
         self,
         token_url: str,
-        scopes: Optional[dict[str, str]] = None,
+        scopes: dict[str, str] | None = None,
         *,
         global_security: bool = True,
     ) -> None:
@@ -209,10 +209,10 @@ class OpenAPIBuilder:
         path: str,
         handler: Callable[..., Any],
         type_injectors: dict[type, Any],
-        tag: Optional[str] = None,
-        secure: Optional[bool] = None,
-        content_type: Optional[str] = None,
-        responses: Optional[dict[int, type]] = None,
+        tag: str | None = None,
+        secure: bool | None = None,
+        content_type: str | None = None,
+        responses: dict[int, type] | None = None,
     ) -> None:
         """Register a route in the spec.
 
@@ -230,7 +230,7 @@ class OpenAPIBuilder:
         sig = inspect.signature(handler)
 
         parameters: list[dict[str, Any]] = []
-        request_body_schema: Optional[dict[str, Any]] = None
+        request_body_schema: dict[str, Any] | None = None
         body_key_properties: dict[str, Any] = {}
         body_key_required: list[str] = []
 

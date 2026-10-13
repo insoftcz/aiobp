@@ -2,7 +2,6 @@
 
 import contextlib
 from types import TracebackType
-from typing import Optional, Union
 
 from aiobp.logging import log
 from aiobp.logging.custom import LoggingConfig, add_devel_log_level, setup_logging
@@ -10,7 +9,7 @@ from aiobp.logging.custom import LoggingConfig, add_devel_log_level, setup_loggi
 __all__ = ["LoggingConfig", "add_devel_log_level", "log", "setup_logging", "suppress_and_log"]
 
 
-_MuteArg = Optional[Union[type[BaseException], tuple[type[BaseException], ...], list[type[BaseException]]]]
+_MuteArg = type[BaseException] | tuple[type[BaseException], ...] | list[type[BaseException]] | None
 
 
 class suppress_and_log(contextlib.suppress):  # noqa: N801
@@ -32,12 +31,13 @@ class suppress_and_log(contextlib.suppress):  # noqa: N801
 
     def __exit__(
         self,
-        exctype: Optional[type[BaseException]],
-        excinst: Optional[BaseException],
-        exctb: Optional[TracebackType],
+        exctype: type[BaseException] | None,
+        excinst: BaseException | None,
+        exctb: TracebackType | None,
     ) -> bool:
         """Check for exception when code execution leaves context"""
-        suppress = exctype is not None and issubclass(exctype, self._exceptions)
-        if suppress and not issubclass(exctype, self._mute):
+        if exctype is None or not issubclass(exctype, self._exceptions):
+            return False
+        if not issubclass(exctype, self._mute):
             log.exception(self._message)
-        return suppress
+        return True
