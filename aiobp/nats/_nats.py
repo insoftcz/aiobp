@@ -474,9 +474,18 @@ class Nats:
                 log.trace('Error handling NATS event "%s"', msg.subject)
 
         self._subscriptions[subject] = await self._client.subscribe(subject, queue=queue or "", cb=on_message)
-        # the subscription is sent to the server asynchronously, make sure it's active once we return
-        await self._client.flush()
+        await self._sync_subscriptions()
         log.debug("Subscribed to NATS subject %s", subject)
+
+    async def _sync_subscriptions(self) -> None:
+        """Make sure the server registered all subscriptions made so far
+
+        nats-py queues SUB for its flusher task but writes PING straight to the socket, so
+        a single flush() sends PING before SUB and its PONG proves nothing. The first flush
+        lets the flusher write the queued SUB, the second PING then follows it on the wire.
+        """
+        await self._client.flush()
+        await self._client.flush()
 
     async def unsubscribe(self, subject: str) -> None:
         """Stop receiving events subscribed by `subscribe(subject, ...)`"""
@@ -535,8 +544,7 @@ class Nats:
         self._rpc_subscriptions[subject] = await self._client.subscribe(
             subject, queue=self._service_name, cb=on_request,
         )
-        # the subscription is sent to the server asynchronously, make sure calls reach us once we return
-        await self._client.flush()
+        await self._sync_subscriptions()
         log.debug("Serving RPC method %s", method)
 
     async def _handle_rpc(self, msg: Msg, method: str, handler: RpcHandler) -> None:
