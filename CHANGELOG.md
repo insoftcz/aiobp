@@ -3,6 +3,21 @@
 All notable changes to this project will be documented in this file.
 
 
+## [3.0.1] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- Run service in the event loop set before runner() is called
+   - asyncio.Runner always created a new loop, so work scheduled into the
+loop the caller had set with asyncio.set_event_loop() (e.g. through
+asyncio.run_coroutine_threadsafe() from synchronous code) never ran.
+runner() now reuses that loop if it is still open, and creates a new
+one only when no loop is set.
+
+New keyword-only `loop_factory` parameter overrides both and is passed
+to asyncio.Runner. 
+
+
 ## [3.0.0] - 2026-10-13
 
 ### 🚀 Features
