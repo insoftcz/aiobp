@@ -151,3 +151,56 @@ def test_shutdown_callback_ignoring_cancellation_doesnt_block_exit() -> None:
     assert "after tasks cancel" in lines  # later callbacks still run
     assert "did not finish in timeout" in stderr
     assert time.monotonic() - started < 5
+
+
+def test_service_runs_in_loop_set_by_caller() -> None:
+    process = start("""
+        import threading
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        # synchronous code schedules work into the loop before runner() starts
+        early = asyncio.run_coroutine_threadsafe(asyncio.sleep(0, "early done"), loop)
+
+        def from_thread():
+            future = asyncio.run_coroutine_threadsafe(asyncio.sleep(0, "thread done"), loop)
+            say(future.result(timeout=2))
+
+        async def main():
+            say("same loop" if asyncio.get_running_loop() is loop else "other loop")
+            await asyncio.to_thread(from_thread)
+
+        runner("test", "1.0", main(), endless=False)
+        say(early.result(timeout=0))
+    """)
+    lines, _ = finish(process)
+    assert lines == ["same loop", "thread done", "early done"]
+
+
+def test_loop_factory_overrides_loop_set_by_caller() -> None:
+    process = start("""
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        factory_loop = asyncio.new_event_loop()
+
+        async def main():
+            say("factory loop" if asyncio.get_running_loop() is factory_loop else "other loop")
+
+        runner("test", "1.0", main(), endless=False, loop_factory=lambda: factory_loop)
+    """)
+    lines, _ = finish(process)
+    assert lines == ["factory loop"]
+
+
+def test_closed_loop_set_by_caller_is_not_reused() -> None:
+    process = start("""
+        closed = asyncio.new_event_loop()
+        asyncio.set_event_loop(closed)
+        closed.close()
+
+        async def main():
+            say("new loop" if asyncio.get_running_loop() is not closed else "closed loop")
+
+        runner("test", "1.0", main(), endless=False)
+    """)
+    lines, _ = finish(process)
+    assert lines == ["new loop"]

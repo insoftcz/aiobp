@@ -5,6 +5,7 @@ import contextlib
 import signal
 import sys
 import time
+import warnings
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -59,13 +60,14 @@ def log_awaitable(awaitable: asyncio.Task | Coroutine) -> str:
     return f'<{awaitable.get_name()} {filename}:{code.co_firstlineno} metod "{code.co_name}">'
 
 
-def runner(
+def runner(  # noqa: PLR0913 - all but service are keyword-only
     service_name: str,
     service_version: str,
     service: Coroutine,
     *,
     shutdown_timeout: float = 5.0,
     endless: bool = True,
+    loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
 ) -> None:
     """Run given service in asyncio.Task and handle SIGTERM/KeyboardInterrupt
 
@@ -84,9 +86,16 @@ def runner(
 
     Whatever `service` raises won't crash this function: it's caught, logged
     as critical, and graceful shutdown proceeds anyway.
+
+    The service runs in the event loop the caller has already set with
+    asyncio.set_event_loop(), so code that scheduled work into that loop before
+    calling runner() (e.g. via asyncio.run_coroutine_threadsafe()) keeps working.
+    Without such a loop a new one is created. loop_factory overrides both.
     """
     log.info("Starting service %s %s on Python %s", service_name, service_version, sys.version.replace("\n", ""))
-    loop_runner = asyncio.Runner()
+    if loop_factory is None and (loop := _current_event_loop()) is not None:
+        loop_factory = lambda: loop  # noqa: E731
+    loop_runner = asyncio.Runner(loop_factory=loop_factory)
     # main does:
     # 1. start given service coroutine as task
     # 2. add SIGTERM and SIGINT handlers
@@ -108,6 +117,18 @@ def runner(
     # ignoring cancellation would block the exit forever — leave the loop as it is then.
     if not asyncio.all_tasks(loop_runner.get_loop()):
         loop_runner.close()
+
+
+def _current_event_loop() -> asyncio.AbstractEventLoop | None:
+    """Return the loop set by asyncio.set_event_loop(), if any"""
+    with warnings.catch_warnings():
+        # Python 3.12-3.13 warn when get_event_loop() has to create the loop
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:  # Python 3.14+ doesn't create the loop implicitly
+            return None
+    return None if loop.is_closed() else loop
 
 
 async def __shutdown() -> None:
