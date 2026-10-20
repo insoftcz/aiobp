@@ -935,6 +935,15 @@ class TestConsumers:
         assert "Not consuming" in caplog.text
 
 
+async def _wait_until_missing(bucket: Bucket[str, Any], key: str) -> None:
+    deadline = time.monotonic() + 5
+    while await bucket.get(key) is not None:
+        if time.monotonic() > deadline:
+            msg = f"{key} didn't expire in time"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.1)
+
+
 # ---------------------------------------------------------------------------
 # Key-value buckets
 # ---------------------------------------------------------------------------
@@ -1070,6 +1079,81 @@ class TestBucket:
         await bucket.update("item", entry)
 
         assert await bucket.get("item") == Item("pear", 3.0)
+
+    async def test_bucket_ttl_expires_records(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"), ttl=1)
+        assert (await bucket.kv.status()).ttl == 1
+        await bucket.put("item", 1)
+        assert await bucket.get("item") == 1
+        await _wait_until_missing(bucket, "item")
+
+    async def test_put_with_ttl_expires_only_that_record(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        await bucket.put("short", 1, ttl=1)
+        await bucket.put("long", 2)
+        assert await bucket.get("short") == 1
+        await _wait_until_missing(bucket, "short")
+        assert await bucket.get("long") == 2
+
+    async def test_put_with_ttl_returns_revision_and_validates_key(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        revision = await bucket.put("item", 1, ttl=60)
+        assert await bucket.get_entry("item") == BucketEntry(value=1, revision=revision)
+        with pytest.raises(js_errors.InvalidKeyError):
+            await bucket.put("bad.*", 1, ttl=60)
+
+    async def test_update_with_ttl_expires_record(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        revision = await bucket.put("item", 1)
+        await bucket.update("item", BucketEntry(value=2, revision=revision), ttl=1)
+        assert await bucket.get("item") == 2
+        await _wait_until_missing(bucket, "item")
+
+    async def test_purge_removes_key_and_history(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        await bucket.put("item", 1)
+        await bucket.put("item", 2)
+        await bucket.purge("item")
+        assert await bucket.get("item") is None
+        assert await bucket.keys() == []
+        assert (await bucket.kv.status()).values == 1  # only the purge marker is left
+
+    async def test_purge_validates_key(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        with pytest.raises(js_errors.InvalidKeyError):
+            await bucket.purge("bad.*")
+
+    async def test_snapshot_yields_current_values_and_ends(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"), value_type=Item)
+        await bucket.put("a", Item("apple", 1.0))
+        rev_b = await bucket.put("b", Item("pear", 2.0))
+        await bucket.put("c", Item("plum", 3.0))
+        await bucket.delete("a")
+        await bucket.purge("c")
+
+        events = [event async for event in bucket.snapshot()]
+        assert events == [("b", Item("pear", 2.0), rev_b)]
+
+    async def test_snapshot_of_empty_bucket_ends(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"))
+        assert [event async for event in bucket.snapshot()] == []
+
+    async def test_snapshot_filters_keys_and_decodes_key_type(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("kv"), key_type=Room)
+        await bucket.put(Room.LOBBY, 1)
+        await bucket.put(Room.KITCHEN, 2)
+        events = [event async for event in bucket.snapshot("kitchen")]
+        assert [(key, value) for key, value, _revision in events] == [(Room.KITCHEN, 2)]
+        assert events[0][0] is Room.KITCHEN
 
     async def test_watch_yields_put_and_delete_events(self, make_nats: NatsFactory) -> None:
         nats = await make_nats()

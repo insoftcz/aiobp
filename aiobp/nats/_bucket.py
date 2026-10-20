@@ -8,7 +8,7 @@ from typing import Any, Generic, TypeVar
 import msgspec
 from nats.errors import ConnectionClosedError
 from nats.js import errors as js_errors
-from nats.js.kv import KeyValue
+from nats.js.kv import KeyValue, _is_key_valid
 
 from aiobp.nats._common import encoder
 
@@ -28,6 +28,11 @@ class Bucket(Generic[K, V]):
     """JetStream key-value bucket with JSON encoded values of type `V`, keyed by `K`
 
     The underlying nats-py `KeyValue` is available as `kv` for anything not covered here.
+
+    `ttl` of `put()` and `update()` makes that one record expire after the given
+    number of seconds (whole seconds, at least 1, requires nats-server 2.11+).
+    An expired record is gone, as if it was never there. A bucket-wide limit is
+    set with `Nats.bucket(name, ttl=...)` instead.
     """
 
     def __init__(self, kv: KeyValue, *, value_type: type[V] | None = None, key_type: type[K] | None = None) -> None:
@@ -70,11 +75,18 @@ class Bucket(Generic[K, V]):
             return None
         return BucketEntry(value=self._decoder.decode(entry.value), revision=entry.revision)
 
-    async def put(self, key: K, value: V) -> int:
-        """Store `value` under `key` and return the new revision"""
-        return await self.kv.put(self._encode_key(key), encoder.encode(value))
+    async def put(self, key: K, value: V, *, ttl: float | None = None) -> int:
+        """Store `value` under `key` and return the new revision, expiring after `ttl` seconds if given"""
+        if ttl is None:
+            return await self.kv.put(self._encode_key(key), encoder.encode(value))
+        # KeyValue.put() has no TTL, publish the way it does with the Nats-TTL header added
+        raw_key = self._encode_key(key)
+        if not _is_key_valid(raw_key):
+            raise js_errors.InvalidKeyError(raw_key)
+        ack = await self.kv._js.publish(f"{self.kv._pre}{raw_key}", encoder.encode(value), msg_ttl=ttl)  # noqa: SLF001
+        return ack.seq
 
-    async def update(self, key: K, entry: BucketEntry[V]) -> int:
+    async def update(self, key: K, entry: BucketEntry[V], *, ttl: float | None = None) -> int:
         """Store `entry.value` under `key`, but only if it's still at `entry.revision`; return the new revision
 
         `entry` is normally the one you got from `get_entry()`, its `value`
@@ -82,12 +94,27 @@ class Bucket(Generic[K, V]):
         based on. Raises nats-py's `KeyWrongLastSequenceError` if `key` was
         changed by someone else since `entry.revision` was read — call
         `get_entry()` again and retry your change against the fresh value.
+        The new value expires after `ttl` seconds if given.
         """
-        return await self.kv.update(self._encode_key(key), encoder.encode(entry.value), last=entry.revision)
+        # KeyValue.update() has no TTL, its _update() does
+        return await self.kv._update(  # noqa: SLF001
+            self._encode_key(key), encoder.encode(entry.value), last=entry.revision, msg_ttl=ttl,
+        )
 
     async def delete(self, key: K) -> None:
         """Remove `key` from the bucket"""
         await self.kv.delete(self._encode_key(key))
+
+    async def purge(self, key: K) -> None:
+        """Remove `key` from the bucket together with all its history
+
+        Unlike `delete()`, which keeps older revisions behind a delete marker
+        in a bucket with history, this leaves only the purge marker.
+        """
+        raw_key = self._encode_key(key)
+        if not _is_key_valid(raw_key):  # KeyValue.purge() doesn't check, unlike delete()
+            raise js_errors.InvalidKeyError(raw_key)
+        await self.kv.purge(raw_key)
 
     async def keys(self) -> list[K]:
         """List keys in the bucket"""
@@ -112,10 +139,33 @@ class Bucket(Generic[K, V]):
         subscription; either way, the underlying watcher is stopped properly
         before this returns.
         """
-        watcher = await self.kv.watch(keys, include_history=include_history)
+        async for event in self._watch(keys, include_history=include_history, snapshot=False):
+            yield event
+
+    async def snapshot(self, keys: str = ">") -> AsyncIterator[tuple[K, V, int]]:
+        """Async-iterate over `(key, value, revision)` of every current key matching `keys`, then end
+
+        Deleted and purged keys are skipped. Ends once it has caught up with
+        the bucket's state at the time of the call, changes made while
+        iterating may or may not be included. `keys` is a raw NATS subject
+        pattern, as in `watch()`.
+        """
+        async for key, value, revision in self._watch(keys, include_history=False, snapshot=True):
+            yield key, value, revision  # type: ignore[misc]  # deletes are skipped, value is never None
+
+    async def _watch(
+        self,
+        keys: str,
+        *,
+        include_history: bool,
+        snapshot: bool,
+    ) -> AsyncIterator[tuple[K, V | None, int]]:
+        watcher = await self.kv.watch(keys, include_history=include_history, ignore_deletes=snapshot)
         try:
             async for entry in watcher:
                 if entry is None:  # internal marker: history replay caught up, not a real change
+                    if snapshot:
+                        return
                     continue
                 # a deletion carries operation="DEL" with an *empty* (not None) value
                 value = self._decoder.decode(entry.value) if entry.value else None

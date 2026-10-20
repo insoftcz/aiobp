@@ -397,14 +397,18 @@ class Nats:
     # to Never, rejecting every get()/put() call on the result) — the real
     # signature right below is what actually runs.
     @overload
-    async def bucket(self, name: str, *, create: bool = True) -> Bucket[str, Any]: ...
-    @overload
-    async def bucket(self, name: str, *, value_type: type[V], create: bool = True) -> Bucket[str, V]: ...
-    @overload
-    async def bucket(self, name: str, *, key_type: type[K], create: bool = True) -> Bucket[K, Any]: ...
+    async def bucket(self, name: str, *, create: bool = True, ttl: float | None = None) -> Bucket[str, Any]: ...
     @overload
     async def bucket(
-        self, name: str, *, value_type: type[V], key_type: type[K], create: bool = True,
+        self, name: str, *, value_type: type[V], create: bool = True, ttl: float | None = None,
+    ) -> Bucket[str, V]: ...
+    @overload
+    async def bucket(
+        self, name: str, *, key_type: type[K], create: bool = True, ttl: float | None = None,
+    ) -> Bucket[K, Any]: ...
+    @overload
+    async def bucket(
+        self, name: str, *, value_type: type[V], key_type: type[K], create: bool = True, ttl: float | None = None,
     ) -> Bucket[K, V]: ...
 
     async def bucket(
@@ -414,6 +418,7 @@ class Nats:
         value_type: type[V] | None = None,
         key_type: type[K] | None = None,
         create: bool = True,
+        ttl: float | None = None,
     ) -> Bucket[K, V]:
         """Return key-value bucket `name`, creating it when it doesn't exist and `create` is True
 
@@ -422,6 +427,10 @@ class Nats:
         (e.g. a `str` `Enum`, `UUID`, or a plain `str` subtype) instead of a
         bare `str`. Both are only used the first time this bucket is opened —
         later calls for the same `name` return the cached instance as-is.
+
+        `ttl` makes every record expire `ttl` seconds after it was written. It
+        is only applied when the bucket is created here, an existing bucket
+        keeps its own setting.
         """
         self._check_connected()
         bucket = self._buckets.get(name)
@@ -433,7 +442,7 @@ class Nats:
         except js_errors.BucketNotFoundError:
             if not create:
                 raise
-            kv = await self._js.create_key_value(bucket=name)
+            kv = await self._js.create_key_value(bucket=name, ttl=ttl)
             log.info("Created key-value bucket %s", name)
 
         self._buckets[name] = bucket = Bucket(kv, value_type=value_type, key_type=key_type)

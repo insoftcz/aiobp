@@ -240,13 +240,33 @@ await settings.get("theme")               # {"color": "dark"}
 await settings.get("missing", "default")  # "default"
 await settings.keys()                     # ["theme"]
 await settings.delete("theme")
+await settings.purge("theme")             # like delete, but drops the key's history too
+
+async for key, value, revision in settings.snapshot():  # current keys, then ends
+    ...
+async for key, value, revision in settings.watch():     # every change, until cancelled
+    ...
 
 await nats.bucket("settings", create=False)  # raises BucketNotFoundError if missing
 await nats.delete_bucket("settings")
 ```
 
+Records can expire, either all of them after the bucket's `ttl` or each one
+after its own `ttl` (seconds, per-record TTL needs nats-server 2.11+):
+
+```python
+sessions = await nats.bucket("sessions", ttl=3600)  # every record expires after an hour
+await sessions.put("abc", {"user": 1})
+await sessions.put("xyz", {"user": 2}, ttl=60)       # this one after a minute
+entry = await sessions.get_entry("xyz")
+await sessions.update("xyz", entry, ttl=60)          # refresh while keeping concurrency check
+```
+
+The bucket's `ttl` is only applied when `bucket()` creates it. An expired
+record is gone, `get()` returns the default.
+
 Values are stored as JSON. `bucket.kv` is the underlying nats-py `KeyValue`
-for anything else (watching, history, revisions).
+for anything else (e.g. history).
 
 Shutdown
 --------
