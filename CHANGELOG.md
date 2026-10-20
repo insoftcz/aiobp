@@ -3,6 +3,25 @@
 All notable changes to this project will be documented in this file.
 
 
+## [3.1.0] - 2026-10-20
+
+### 🚀 Features
+
+- Bucket TTL, purge() and snapshot() for NATS key-value buckets
+   - New `ttl` of `Nats.bucket()` makes every record expire after that many
+seconds, applied only when the bucket is created. `Bucket.put()` and
+`Bucket.update()` take a `ttl` too, expiring just that record
+(nats-server 2.11+).
+
+`Bucket.purge()` removes a key together with its history.
+`Bucket.snapshot()` iterates over current keys, skipping deleted ones,
+and ends once it has caught up. 
+
+### 🐛 Bug Fixes
+
+- Added msgspec into optional config_yaml
+
+
 ## [3.0.1] - 2026-10-19
 
 ### 🐛 Bug Fixes

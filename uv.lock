@@ -10,7 +10,7 @@ resolution-markers = [
 
 [[package]]
 name = "aiobp"
-version = "3.0.1"
+version = "3.1.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -22,6 +22,7 @@ config = [
     { name = "msgspec" },
 ]
 config-yaml = [
+    { name = "msgspec" },
     { name = "pyyaml" },
 ]
 logging-otel = [
@@ -51,6 +52,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'aiohttp'", specifier = ">=3.13.3" },
     { name = "msgspec", marker = "extra == 'aiohttp'", specifier = ">=0.19.0" },
     { name = "msgspec", marker = "extra == 'config'", specifier = ">=0.19.0" },
+    { name = "msgspec", marker = "extra == 'config-yaml'", specifier = ">=0.19.0" },
     { name = "msgspec", marker = "extra == 'nats'", specifier = ">=0.19.0" },
     { name = "nats-py", marker = "extra == 'nats'", specifier = ">=2.16.0,<3" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'logging-otel'", specifier = ">=1.20.0" },
