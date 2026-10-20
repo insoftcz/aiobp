@@ -16,6 +16,7 @@ config = [
     "msgspec>=0.19.0",
 ]
 config_yaml = [
+    "msgspec>=0.19.0",
     "pyyaml>=6.0.2",
 ]
 logging_otel = [
