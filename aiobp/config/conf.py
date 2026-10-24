@@ -1,10 +1,13 @@
 """INI like configuration loader"""
 
 from configparser import ConfigParser
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
+
+from aiobp.config.sections import fill_sections
 
 
 def parse_value(s: str, t: type) -> Any:  # noqa: ANN401
@@ -57,24 +60,15 @@ def __ini_typer(obj: Annotated, data: dict[Any, Any]) -> dict[Any, Any]:
     """Value type conversion based on annotations"""
     hints = get_type_hints(obj)
     result = {key: __retype(val, hints.get(key)) for key, val in data.items()}
-
-    for key, hint_type in hints.items():
-        if key not in result:
-            basic_type = get_origin(hint_type) or hint_type
-            if isinstance(basic_type, type) and (
-                is_dataclass(basic_type) or issubclass(basic_type, msgspec.Struct)
-            ):
-                result[key] = {}
-
-    return result
+    return fill_sections(obj, result)
 
 
-def loader(config_class: type[dataclass], filename: str | None = None) -> Annotated:
-    """INI like configuration loader"""
-    if filename is None:
-        return msgspec.convert({}, type=config_class)
+def loader(config_class: type[dataclass], filename: str | Path | None = None) -> Annotated:
+    """INI like configuration loader, defaults are used without filename or when the file doesn't exist"""
+    config: dict[str, dict[str, str]] = {}
+    if filename is not None:
+        conf = ConfigParser()
+        conf.read(filename)
+        config = {section: dict(conf.items(section)) for section in conf.sections()}
 
-    conf = ConfigParser()
-    conf.read(filename)
-    config = {section: dict(conf.items(section)) for section in conf.sections()}
     return msgspec.convert(__ini_typer(config_class, config), type=config_class)

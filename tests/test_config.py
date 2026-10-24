@@ -1,10 +1,18 @@
 """Test config loaders"""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import msgspec
+import pytest
 
 from aiobp.config.conf import loader as conf_loader
-from aiobp.config.yaml import loader as json_loader
+from aiobp.config.json import loader as json_loader
 from aiobp.config.yaml import loader as yaml_loader
+
+LOADERS = [conf_loader, json_loader, yaml_loader]
 
 
 @dataclass
@@ -59,6 +67,7 @@ defaults = Config(
     users={},
 )
 
+
 def test_conf_loader() -> None:
     config = conf_loader(Config, "tests/config.conf")
     assert config == expected
@@ -87,3 +96,82 @@ def test_json_defaults() -> None:
 def test_yaml_defaults() -> None:
     config = yaml_loader(Config)
     assert config == defaults
+
+
+# Sections without defaults, like most services declare them
+
+
+class Log(msgspec.Struct):
+    level: str = "DEBUG"
+    filename: str | None = None
+
+
+class Limits(msgspec.Struct):
+    size: int = 1024
+
+
+class Root(msgspec.Struct):
+    limits: Limits  # nested section without default
+    allow: bool = False
+
+
+class Required(msgspec.Struct):
+    root: Root
+    log: Log
+
+
+required_defaults = Required(root=Root(allow=False, limits=Limits(size=1024)), log=Log(level="DEBUG", filename=None))
+
+
+@pytest.mark.parametrize("loader", LOADERS)
+def test_required_sections_without_filename(loader: Callable[..., Any]) -> None:
+    assert loader(Required) == required_defaults
+
+
+@pytest.mark.parametrize(
+    ("loader", "content"),
+    [
+        (conf_loader, "[root]\nallow = true\n"),
+        (json_loader, '{"root": {"allow": true}}'),
+        (yaml_loader, "root:\n  allow: true\n"),
+    ],
+)
+def test_missing_required_sections(loader: Callable[..., Any], content: str, tmp_path: Path) -> None:
+    filename = tmp_path / "config"
+    filename.write_text(content)
+    config = loader(Required, filename)
+    assert config == Required(root=Root(allow=True, limits=Limits()), log=Log())
+
+
+def test_conf_missing_file(tmp_path: Path) -> None:
+    assert conf_loader(Required, tmp_path / "missing.conf") == required_defaults
+
+
+def test_yaml_empty_file(tmp_path: Path) -> None:
+    filename = tmp_path / "config.yaml"
+    filename.touch()
+    assert yaml_loader(Required, filename) == required_defaults
+
+
+@dataclass
+class FactoryConfig:
+    log: Log = field(default_factory=lambda: Log(level="INFO"))
+
+
+@pytest.mark.parametrize("loader", LOADERS)
+def test_section_default_factory(loader: Callable[..., Any]) -> None:
+    assert loader(FactoryConfig).log == Log(level="INFO")
+
+
+def test_conf_section_default_factory_with_file(tmp_path: Path) -> None:
+    filename = tmp_path / "config.conf"
+    filename.write_text("[other]\nkey = value\n")
+    assert conf_loader(FactoryConfig, filename).log == Log(level="INFO")
+
+
+@pytest.mark.parametrize(
+    ("loader", "filename"),
+    [(conf_loader, "tests/config.conf"), (json_loader, "tests/config.json"), (yaml_loader, "tests/config.yaml")],
+)
+def test_path(loader: Callable[..., Any], filename: str) -> None:
+    assert loader(Config, Path(filename)) == expected
