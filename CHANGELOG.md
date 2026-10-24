@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 
 
+## [3.1.1] - 2026-10-24
+
+### 🐛 Bug Fixes
+
+- Config loaders use defaults for missing sections and accept Path
+   - Missing sections without a default of their own are filled in recursively for
+all loaders, also when no filename is given, so services can declare sections
+without defaults. Sections with a default (default_factory) keep it, the INI
+loader replaced it with an empty section before. Empty YAML file gives
+defaults. Loaders accept str or Path. Fixed test_json_loader testing YAML
+loader. 
+
+
 ## [3.1.0] - 2026-10-20
 
 ### 🚀 Features
