@@ -3,6 +3,25 @@
 All notable changes to this project will be documented in this file.
 
 
+## [3.2.0] - 2026-11-06
+
+### 🚀 Features
+
+- Pluggable NATS encoder, RPC dispatch and broadcast, bucket admin helpers
+   - - Nats(encoder=...) encodes outgoing payloads (events, RPC requests and
+  replies, bucket values) to keep an existing wire format
+- Nats(on_connected=...) is called after connect() and every reconnect
+- serve(..., broadcast=True) lets every service instance handle every call
+- serve_dispatch(pattern, dispatcher) handles wildcard RPC methods, the
+  dispatcher gets RpcRequest with method, args, kwargs and headers
+- RpcError(data=...) replies structured error payloads; every reply code
+  other than 1 raises RpcError on the calling side
+- Nats.buckets() lists key-value buckets as BucketInfo
+- Bucket.create() stores a key only when missing, Bucket.delete(revision=)
+  deletes only when the key wasn't changed meanwhile
+- Bucket.raw() view reads and writes undecoded payload bytes 
+
+
 ## [3.1.1] - 2026-10-24
 
 ### 🐛 Bug Fixes
