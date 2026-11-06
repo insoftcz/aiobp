@@ -75,12 +75,17 @@ section. `url` may list several servers of a cluster separated by commas:
 url = nats://nats1:4222,nats://nats2:4222
 ```
 
-`Nats(service_name, config, *, location=None, rpc_timeout=2.0)`:
+`Nats(service_name, config, *, location=None, rpc_timeout=2.0, encoder=None, on_connected=None)`:
 
 - `service_name` identifies the service. The connection is named
   `<service_name>@<location>`, where `location` defaults to the machine's FQDN.
   All instances of one service share RPC calls and JetStream messages (see below).
 - `rpc_timeout` is the default timeout of `call()` and `request()` in seconds.
+- `encoder` replaces msgspec for outgoing payloads, see [Custom encoder](#custom-encoder).
+- `on_connected()` (sync or async) is called at the end of `connect()` and after
+  every reconnect, e.g. to resynchronize state with other services. On reconnect
+  it runs as a separate task. Subscriptions survive reconnects on their own. An
+  exception raised by it is logged, the connection keeps working.
 
 The connection reconnects forever and never receives messages it published
 itself (`no_echo`). A service therefore can't `call()` an RPC method it serves.
@@ -181,11 +186,35 @@ call_id = await nats.call("ami.originate", ("101", "+420123456789"), timeout=5.0
 `call()` accepts `timeout=` next to the arguments, the attribute form always uses
 the default `rpc_timeout`.
 
+`serve(method, handler, broadcast=True)` makes every instance of the service
+handle every call; the caller gets the reply of the fastest one. Any side effect
+of the call happens on all instances, use it only when that is intended.
+
+To handle many methods by one function, e.g. to expose an existing API whose
+methods are registered at runtime, use `serve_dispatch()`. The pattern may
+contain wildcards, the dispatcher gets an `RpcRequest` with the called `method`,
+`args`, `kwargs` and the NATS `headers` of the call:
+
+```python
+async def dispatch(request: RpcRequest) -> Any:
+    handler = API.get(request.method.removeprefix("ucs."))
+    if handler is None:
+        raise RpcError(f'Unknown method "{request.method}"', code=-2)
+    return await handler(request.headers.get("user"), *request.args, **request.kwargs)
+
+await nats.serve_dispatch("ucs.>", dispatch)  # broadcast= works like in serve()
+```
+
 Errors:
 
 - Raise `RpcError(message, code=...)` in a handler for expected failures. The
   caller gets `RpcError` with the same `message` and `code`, nothing is logged
   as a traceback.
+- `RpcError(message, code=..., data=...)` sends `data` (any JSON value, e.g.
+  `{"number": "already exists"}`) instead of `message`. The caller gets it as
+  `error.data`, with `error.message` being its `str()`. An error with a string
+  payload has `data=None`.
+- Every reply code other than `1` raises `RpcError`, negative codes included.
 - Any other exception is logged with traceback and the caller gets
   `RpcError("Internal error", code=0)`. Internal details never leave the service.
 - When nobody serves the method, `call()` raises `nats.errors.NoRespondersError`.
@@ -195,7 +224,7 @@ Errors:
 
 Wire format, for services in other languages: the request is sent to subject
 `rpc.<method>` with payload `[args, kwargs]`; the reply is `[1, result]` on
-success or `[code, message]` on failure.
+success or `[code, message]` (or `[code, data]`) on failure.
 
 `request(subject, payload, timeout=None)` sends a raw request and returns the
 raw reply bytes, for subjects that don't use the RPC format.
@@ -239,6 +268,7 @@ await settings.put("theme", {"color": "dark"})
 await settings.get("theme")               # {"color": "dark"}
 await settings.get("missing", "default")  # "default"
 await settings.keys()                     # ["theme"]
+await settings.create("font", "mono")     # only if "font" doesn't exist yet
 await settings.delete("theme")
 await settings.purge("theme")             # like delete, but drops the key's history too
 
@@ -248,8 +278,24 @@ async for key, value, revision in settings.watch():     # every change, until ca
     ...
 
 await nats.bucket("settings", create=False)  # raises BucketNotFoundError if missing
+await nats.buckets()                          # [BucketInfo(name, messages, bytes, history, ttl), ...]
 await nats.delete_bucket("settings")
 ```
+
+Optimistic concurrency: `get_entry()` returns the value with its revision,
+`update()` stores a new value and `delete(key, revision=...)` removes the key only
+if nobody changed it since. Otherwise both raise nats-py's `KeyWrongLastSequenceError`.
+
+```python
+entry = await settings.get_entry("theme")
+entry.value["color"] = "light"
+revision = await settings.update("theme", entry)
+await settings.delete("theme", revision=revision)
+```
+
+`bucket.raw()` is a view of the same bucket that skips JSON: `get()`, `snapshot()`
+and the like return payload bytes, `put()`, `create()` and `update()` take bytes.
+Use it for buckets whose values may not be JSON.
 
 Records can expire, either all of them after the bucket's `ttl` or each one
 after its own `ttl` (seconds, per-record TTL needs nats-server 2.11+):
@@ -265,8 +311,27 @@ await sessions.update("xyz", entry, ttl=60)          # refresh while keeping con
 The bucket's `ttl` is only applied when `bucket()` creates it. An expired
 record is gone, `get()` returns the default.
 
-Values are stored as JSON. `bucket.kv` is the underlying nats-py `KeyValue`
+Values are stored as JSON (by the custom encoder, when given). `bucket.kv` is the underlying nats-py `KeyValue`
 for anything else (e.g. history).
+
+Custom encoder
+--------------
+
+Outgoing payloads (events, RPC requests and replies, bucket values) are encoded
+by msgspec. A system with an established wire format may encode them its own way:
+
+```python
+def encode(data: Any) -> bytes:
+    return json.dumps(data, cls=LegacyEncoder).encode()
+
+nats = Nats("ucs-server", config, encoder=encode)
+```
+
+The encoder must raise `TypeError` or `ValueError` for a value it can't encode, so
+an RPC reply turns into `RpcError("Internal error")` instead of a wrong result.
+`bytes` passed to `publish()` are still sent unchanged. `msgspec.Struct` values
+can only be sent when the encoder supports them. Incoming payloads are always
+decoded by msgspec.
 
 Shutdown
 --------

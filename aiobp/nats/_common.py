@@ -9,6 +9,9 @@ from nats.aio.msg import Msg
 
 encoder = msgspec.json.Encoder()
 decoder = msgspec.json.Decoder()
+
+# Turns a value into payload bytes. It must raise TypeError or ValueError for a value it can't encode.
+Encoder = Callable[[Any], bytes]
 INVALID = object()  # decode_payload() result for a payload that isn't JSON
 
 

@@ -1,6 +1,6 @@
 """JetStream key-value bucket with typed keys and values"""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -10,10 +10,20 @@ from nats.errors import ConnectionClosedError
 from nats.js import errors as js_errors
 from nats.js.kv import KeyValue, _is_key_valid
 
-from aiobp.nats._common import encoder
+from aiobp.nats._common import Encoder, encoder
 
 K = TypeVar("K")
 V = TypeVar("V")
+
+# JetStream error codes of a failed "expected last subject sequence" check
+_WRONG_LAST_SEQUENCE_CODES = (10071, 10164)
+
+
+def _encode_raw(value: Any) -> bytes:  # noqa: ANN401
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        msg = f"Raw bucket value must be bytes, not {type(value).__name__}"
+        raise TypeError(msg)
+    return bytes(value)
 
 
 @dataclass
@@ -24,10 +34,22 @@ class BucketEntry(Generic[V]):
     revision: int | None
 
 
+@dataclass
+class BucketInfo:
+    """Key-value bucket listed by `Nats.buckets()`"""
+
+    name: str
+    messages: int  # stored records, including history and delete markers
+    bytes: int
+    history: int  # revisions kept per key
+    ttl: float | None  # seconds a record lives, None for forever
+
+
 class Bucket(Generic[K, V]):
     """JetStream key-value bucket with JSON encoded values of type `V`, keyed by `K`
 
-    The underlying nats-py `KeyValue` is available as `kv` for anything not covered here.
+    The underlying nats-py `KeyValue` is available as `kv` for anything not covered here,
+    `raw()` gives a view reading and writing undecoded payload bytes.
 
     `ttl` of `put()` and `update()` makes that one record expire after the given
     number of seconds (whole seconds, at least 1, requires nats-server 2.11+).
@@ -35,10 +57,30 @@ class Bucket(Generic[K, V]):
     set with `Nats.bucket(name, ttl=...)` instead.
     """
 
-    def __init__(self, kv: KeyValue, *, value_type: type[V] | None = None, key_type: type[K] | None = None) -> None:
+    def __init__(
+        self,
+        kv: KeyValue,
+        *,
+        value_type: type[V] | None = None,
+        key_type: type[K] | None = None,
+        encode: Encoder | None = None,
+    ) -> None:
         self.kv: KeyValue = kv
+        self._encode: Encoder = encode if encode is not None else encoder.encode
         self._decoder: msgspec.json.Decoder = msgspec.json.Decoder(type=value_type if value_type is not None else Any)
+        self._decode: Callable[[bytes], Any] = self._decoder.decode
         self._key_type: type[K] = key_type if key_type is not None else str  # type: ignore[assignment]
+
+    def raw(self) -> "Bucket[K, bytes]":
+        """View of this bucket with undecoded values
+
+        `get()`, `snapshot()` and the like return the payload bytes, `put()`, `create()`
+        and `update()` store bytes as they are. Use it for values that may not be JSON.
+        Keys are still converted to `K`.
+        """
+        view: Bucket[K, bytes] = Bucket(self.kv, key_type=self._key_type, encode=_encode_raw)
+        view._decode = bytes
+        return view
 
     def _encode_key(self, key: K) -> str:
         # str.__str__, not str(key): a str subclass (e.g. a str Enum) can override __str__ to
@@ -62,7 +104,7 @@ class Bucket(Generic[K, V]):
         entry = await self._get(key)
         if entry is None or entry.value is None:
             return default
-        return self._decoder.decode(entry.value)
+        return self._decode(entry.value)
 
     async def get_entry(self, key: K) -> BucketEntry[V] | None:
         """Return `key`'s value together with its revision, or None when there is none
@@ -73,17 +115,17 @@ class Bucket(Generic[K, V]):
         entry = await self._get(key)
         if entry is None or entry.value is None:
             return None
-        return BucketEntry(value=self._decoder.decode(entry.value), revision=entry.revision)
+        return BucketEntry(value=self._decode(entry.value), revision=entry.revision)
 
     async def put(self, key: K, value: V, *, ttl: float | None = None) -> int:
         """Store `value` under `key` and return the new revision, expiring after `ttl` seconds if given"""
         if ttl is None:
-            return await self.kv.put(self._encode_key(key), encoder.encode(value))
+            return await self.kv.put(self._encode_key(key), self._encode(value))
         # KeyValue.put() has no TTL, publish the way it does with the Nats-TTL header added
         raw_key = self._encode_key(key)
         if not _is_key_valid(raw_key):
             raise js_errors.InvalidKeyError(raw_key)
-        ack = await self.kv._js.publish(f"{self.kv._pre}{raw_key}", encoder.encode(value), msg_ttl=ttl)  # noqa: SLF001
+        ack = await self.kv._js.publish(f"{self.kv._pre}{raw_key}", self._encode(value), msg_ttl=ttl)  # noqa: SLF001
         return ack.seq
 
     async def update(self, key: K, entry: BucketEntry[V], *, ttl: float | None = None) -> int:
@@ -98,12 +140,30 @@ class Bucket(Generic[K, V]):
         """
         # KeyValue.update() has no TTL, its _update() does
         return await self.kv._update(  # noqa: SLF001
-            self._encode_key(key), encoder.encode(entry.value), last=entry.revision, msg_ttl=ttl,
+            self._encode_key(key), self._encode(entry.value), last=entry.revision, msg_ttl=ttl,
         )
 
-    async def delete(self, key: K) -> None:
-        """Remove `key` from the bucket"""
-        await self.kv.delete(self._encode_key(key))
+    async def create(self, key: K, value: V, *, ttl: float | None = None) -> int:
+        """Store `value` under `key` only if `key` doesn't exist (or was deleted); return the new revision
+
+        Raises nats-py's `KeyWrongLastSequenceError` if `key` exists. The value
+        expires after `ttl` seconds if given.
+        """
+        return await self.kv.create(self._encode_key(key), self._encode(value), msg_ttl=ttl)
+
+    async def delete(self, key: K, *, revision: int | None = None) -> None:
+        """Remove `key` from the bucket
+
+        With `revision`, only if `key` is still at that revision — raises nats-py's
+        `KeyWrongLastSequenceError` if it was changed by someone else meanwhile.
+        """
+        try:
+            await self.kv.delete(self._encode_key(key), last=revision)
+        except js_errors.APIError as error:
+            # KeyValue.delete() doesn't translate it, unlike KeyValue.update()
+            if error.err_code in _WRONG_LAST_SEQUENCE_CODES:
+                raise js_errors.KeyWrongLastSequenceError(description=error.description) from error
+            raise
 
     async def purge(self, key: K) -> None:
         """Remove `key` from the bucket together with all its history
@@ -168,7 +228,7 @@ class Bucket(Generic[K, V]):
                         return
                     continue
                 # a deletion carries operation="DEL" with an *empty* (not None) value
-                value = self._decoder.decode(entry.value) if entry.value else None
+                value = self._decode(entry.value) if entry.value else None
                 yield self._decode_key(entry.key), value, entry.revision
         finally:
             # the runner may disconnect NATS before cancelling tasks, the subscription is gone with

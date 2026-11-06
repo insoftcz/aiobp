@@ -3,12 +3,15 @@
 import asyncio
 import functools
 import importlib
+import json
 import logging
 import shutil
 import socket
 import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -19,7 +22,7 @@ from nats.errors import NoRespondersError
 from nats.errors import TimeoutError as NatsTimeoutError
 from nats.js import errors as js_errors
 
-from aiobp.nats import Bucket, BucketEntry, Nats, NatsConfig, RpcError
+from aiobp.nats import Bucket, BucketEntry, Nats, NatsConfig, RpcError, RpcRequest
 
 # the aiobp package re-exports the runner() function under the module's name
 _runner_module = importlib.import_module("aiobp.runner")
@@ -764,6 +767,232 @@ class TestRpc:
         await b.disconnect()
         assert await call == "done"
 
+    async def test_rpc_error_data_is_propagated(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        method = unique("calc.invalid")
+
+        def invalid() -> None:
+            msg = "number: already exists"
+            raise RpcError(msg, code=0, data={"number": "already exists"})
+
+        await b.serve(method, invalid)
+        code, payload = msgspec.json.decode(await a.request(f"rpc.{method}", b"[[], {}]"))
+        assert (code, payload) == (0, {"number": "already exists"})  # data replaces message on the wire
+        with pytest.raises(RpcError) as error:
+            await a.call(method)
+        assert error.value.code == 0
+        assert error.value.data == {"number": "already exists"}
+        assert error.value.message == str({"number": "already exists"})
+
+    async def test_string_error_has_no_data(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        method = unique("calc.denied")
+
+        def denied() -> None:
+            msg = "Permission denied"
+            raise RpcError(msg, code=-1)
+
+        await b.serve(method, denied)
+        with pytest.raises(RpcError) as error:
+            await a.call(method)
+        assert (error.value.code, error.value.message, error.value.data) == (-1, "Permission denied", None)
+
+    @pytest.mark.parametrize("code", [0, -1, -1000, 2])
+    async def test_every_code_but_ok_raises(self, pair: tuple[Nats, Nats], code: int) -> None:
+        a, b = pair
+        method = unique("calc.code")
+
+        async def respond(msg: Any) -> None:  # noqa: ANN401
+            await msg.respond(msgspec.json.encode((code, "failed")))
+
+        await b.client.subscribe(f"rpc.{method}", cb=respond)
+        await b.client.flush()
+        await b.client.flush()
+        with pytest.raises(RpcError) as error:
+            await a.call(method)
+        assert error.value.code == code
+
+    async def test_broadcast_is_handled_by_every_instance(self, make_nats: NatsFactory) -> None:
+        caller = await make_nats("caller")
+        first = await make_nats("worker", location="one")
+        second = await make_nats("worker", location="two")
+        method = unique("work.all")
+        handled: list[str] = []
+        await first.serve(method, lambda: handled.append("one"), broadcast=True)
+        await second.serve(method, lambda: handled.append("two"), broadcast=True)
+        for _ in range(5):
+            await caller.call(method)
+        await wait_until(lambda: len(handled) == 10)
+        assert sorted(handled) == ["one"] * 5 + ["two"] * 5
+
+    async def test_serve_dispatch(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        service = unique("svc")
+        requests: list[RpcRequest] = []
+
+        async def dispatch(request: RpcRequest) -> Any:  # noqa: ANN401
+            requests.append(request)
+            if request.method == f"{service}.add":
+                return sum(request.args) * request.kwargs.get("scale", 1)
+            msg = f'Unknown method "{request.method}"'
+            raise RpcError(msg, code=-2)
+
+        await b.serve_dispatch(f"{service}.>", dispatch)
+        assert await a.call(f"{service}.add", (1, 2), {"scale": 2}) == 6
+        assert await getattr(a.rpc, service).add(3, 4) == 7
+        with pytest.raises(RpcError, match="Unknown method") as error:
+            await a.call(f"{service}.nope.deep")
+        assert error.value.code == -2
+        assert [r.method for r in requests] == [f"{service}.add", f"{service}.add", f"{service}.nope.deep"]
+        assert requests[0].headers == {}
+
+    async def test_serve_dispatch_passes_headers(self, pair: tuple[Nats, Nats]) -> None:
+        a, b = pair
+        service = unique("svc")
+        await b.serve_dispatch(f"{service}.*", lambda request: request.headers.get("user"))
+        reply = await a.client.request(f"rpc.{service}.who", b"[[], {}]", headers={"user": "alice"})
+        assert msgspec.json.decode(reply.data) == [1, "alice"]
+
+    async def test_serve_dispatch_broadcast(self, make_nats: NatsFactory) -> None:
+        caller = await make_nats("caller")
+        first = await make_nats("worker", location="one")
+        second = await make_nats("worker", location="two")
+        service = unique("svc")
+        handled: list[str] = []
+        await first.serve_dispatch(f"{service}.>", lambda r: handled.append(f"one:{r.method}"), broadcast=True)
+        await second.serve_dispatch(f"{service}.>", lambda r: handled.append(f"two:{r.method}"), broadcast=True)
+        await caller.call(f"{service}.x")
+        await wait_until(lambda: len(handled) == 2)
+        assert sorted(handled) == [f"one:{service}.x", f"two:{service}.x"]
+
+    async def test_serve_dispatch_twice_raises(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        pattern = unique("svc") + ".>"
+        await nats.serve_dispatch(pattern, lambda _r: None)
+        with pytest.raises(ValueError, match="already served"):
+            await nats.serve_dispatch(pattern, lambda _r: None)
+
+
+# ---------------------------------------------------------------------------
+# Custom encoder
+# ---------------------------------------------------------------------------
+
+
+def legacy_encode(data: Any) -> bytes:  # noqa: ANN401
+    """Encode the way a legacy system does: Decimal as float, datetime as YYYY-MM-DD HH:MM:SS"""
+
+    def default(value: Any) -> Any:  # noqa: ANN401
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"Can't encode {type(value)}"
+        raise TypeError(msg)
+
+    return json.dumps(data, default=default).encode("ascii")
+
+
+LEGACY_VALUE = {"price": Decimal("1.5"), "at": datetime(2026, 1, 2, 3, 4, 5)}  # noqa: DTZ001
+LEGACY_DECODED = {"price": 1.5, "at": "2026-01-02 03:04:05"}
+
+
+class TestEncoder:
+
+    async def test_publish_uses_encoder(self, make_nats: NatsFactory) -> None:
+        publisher = await make_nats("pub", encoder=legacy_encode)
+        subscriber = await make_nats("sub")
+        subject = unique("ev.legacy")
+        received: list[Any] = []
+        await subscriber.subscribe(subject, lambda _s, d: received.append(d))
+        await publisher.publish(subject, LEGACY_VALUE)
+        await wait_until(lambda: len(received) == 1)
+        assert received == [LEGACY_DECODED]
+
+    async def test_bytes_are_not_encoded(self, make_nats: NatsFactory) -> None:
+        def fail(_data: Any) -> bytes:  # noqa: ANN401
+            raise AssertionError
+
+        publisher = await make_nats("pub", encoder=fail)
+        subscriber = await make_nats("sub")
+        subject = unique("ev.raw")
+        received: list[Any] = []
+        await subscriber.subscribe(subject, lambda _s, d: received.append(d), raw=True)
+        await publisher.publish(subject, b"as is")
+        await wait_until(lambda: len(received) == 1)
+        assert received == [b"as is"]
+
+    async def test_call_and_reply_use_encoder(self, make_nats: NatsFactory) -> None:
+        caller = await make_nats("caller", encoder=legacy_encode)
+        server = await make_nats("server", encoder=legacy_encode)
+        method = unique("legacy.echo")
+        await server.serve(method, lambda value: {**value, "now": LEGACY_VALUE["at"]})
+        result = await caller.call(method, (LEGACY_VALUE,))
+        assert result == {**LEGACY_DECODED, "now": "2026-01-02 03:04:05"}
+
+    @pytest.mark.parametrize("error", [TypeError, ValueError])
+    async def test_unencodable_reply_is_internal_error(
+        self, pair: tuple[Nats, Nats], make_nats: NatsFactory, error: type[Exception],
+    ) -> None:
+        a, _ = pair
+
+        def picky(data: Any) -> bytes:  # noqa: ANN401
+            if data == (1, "bad"):
+                raise error
+            return msgspec.json.encode(data)
+
+        server = await make_nats("server", encoder=picky)
+        method = unique("legacy.bad")
+        await server.serve(method, lambda: "bad")
+        with pytest.raises(RpcError, match="Internal error"):
+            await a.call(method)
+
+    async def test_bucket_uses_encoder(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats(encoder=legacy_encode)
+        bucket = await nats.bucket(unique("legacy"))
+        await bucket.put("key", LEGACY_VALUE)
+        assert await bucket.get("key") == LEGACY_DECODED
+        entry = await bucket.get_entry("key")
+        assert entry is not None
+        entry.value = LEGACY_VALUE  # type: ignore[assignment]
+        await bucket.update("key", entry, ttl=None)
+        assert (await bucket.kv.get("key")).value == legacy_encode(LEGACY_VALUE)
+
+
+# ---------------------------------------------------------------------------
+# on_connected hook
+# ---------------------------------------------------------------------------
+
+
+class TestOnConnected:
+
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_called_on_connect(self, make_nats: NatsFactory, is_async: bool) -> None:  # noqa: FBT001
+        called: list[bool] = []
+
+        async def async_hook() -> None:
+            called.append(True)
+
+        await make_nats(on_connected=async_hook if is_async else lambda: called.append(True))
+        assert called == [True]  # awaited by connect(), before it returns
+
+    async def test_called_on_reconnect(self, make_nats: NatsFactory) -> None:
+        called: list[bool] = []
+        nats = await make_nats(on_connected=lambda: called.append(True))
+        await nats._on_reconnected()  # noqa: SLF001 - nats-py calls it after reconnecting
+        await wait_until(lambda: len(called) == 2)
+
+    async def test_failing_hook_doesnt_break_connection(
+        self, make_nats: NatsFactory, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        def broken() -> None:
+            msg = "hook failed"
+            raise RuntimeError(msg)
+
+        with caplog.at_level(logging.ERROR):
+            nats = await make_nats(on_connected=broken)
+        assert nats.connected
+        assert "on_connected handler failed" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # JetStream consumers
@@ -965,6 +1194,65 @@ class TestBucket:
         await bucket.delete("item")
         assert await bucket.get("item") is None
         assert await bucket.keys() == []
+
+    async def test_buckets_lists_kv_buckets_only(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        await add_stream(nats)  # a plain stream isn't a bucket
+        first, second = unique("list-b"), unique("list-a")
+        await nats.bucket(first, ttl=60)
+        bucket = await nats.bucket(second)
+        await bucket.put("key", {"x": 1})
+        listed = {info.name: info for info in await nats.buckets()}
+        assert {first, second} <= set(listed)
+        assert all(not name.startswith("KV_") for name in listed)
+        assert listed[first].ttl == 60
+        assert listed[second].ttl is None
+        assert listed[second].messages == 1
+        assert listed[second].bytes > 0
+        assert listed[second].history >= 1
+        names = [info.name for info in await nats.buckets()]
+        assert names == sorted(names)
+
+    async def test_create_only_when_missing(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("create"))
+        revision = await bucket.create("key", {"v": 1})
+        assert (await bucket.get_entry("key")) == BucketEntry({"v": 1}, revision)
+        with pytest.raises(js_errors.KeyWrongLastSequenceError):
+            await bucket.create("key", {"v": 2})
+        await bucket.delete("key")
+        await bucket.create("key", {"v": 3})  # a deleted key can be created again
+        assert await bucket.get("key") == {"v": 3}
+
+    async def test_delete_with_revision(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("delete"))
+        old = await bucket.put("key", 1)
+        current = await bucket.put("key", 2)
+        with pytest.raises(js_errors.KeyWrongLastSequenceError):
+            await bucket.delete("key", revision=old)
+        assert await bucket.get("key") == 2
+        await bucket.delete("key", revision=current)
+        assert await bucket.get("key") is None
+
+    async def test_raw_view(self, make_nats: NatsFactory) -> None:
+        nats = await make_nats()
+        bucket = await nats.bucket(unique("raw"))
+        raw = bucket.raw()
+        await raw.put("binary", b"\x00not json")
+        await bucket.put("json", {"a": 1})
+        assert await raw.get("binary") == b"\x00not json"
+        assert await raw.get("json") == b'{"a":1}'
+        entry = await raw.get_entry("json")
+        assert entry is not None
+        assert entry.value == b'{"a":1}'
+        assert sorted([(key, value) async for key, value, _ in raw.snapshot()]) == [
+            ("binary", b"\x00not json"), ("json", b'{"a":1}'),
+        ]
+        with pytest.raises(TypeError, match="must be bytes"):
+            await raw.put("x", {"a": 1})  # type: ignore[arg-type]
+        with pytest.raises(msgspec.DecodeError):
+            await bucket.get("binary")
 
     async def test_bucket_is_cached(self, make_nats: NatsFactory) -> None:
         nats = await make_nats()

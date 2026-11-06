@@ -2,6 +2,7 @@
 
 import reprlib
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from aiobp.nats._common import INVALID, decode_payload
@@ -25,15 +26,38 @@ class RpcError(Exception):
     Raise it from an RPC handler to reply with an error `message` (and optional
     `code`) without logging a traceback — use it for expected failures such as
     invalid arguments. `Nats.call()` raises it when the remote handler failed.
+
+    `data` is sent in the reply instead of `message` when given, for errors carrying
+    structured details (e.g. `{"field": "error"}`). On the calling side `data` holds
+    such a non-string error payload as it was received, `message` its `str()`.
     """
 
-    def __init__(self, message: str, code: int = 0) -> None:
+    def __init__(self, message: str, code: int = 0, data: Any = None) -> None:  # noqa: ANN401
         if code == RPC_OK:
             msg = f"RPC error code can't be {RPC_OK}, it means success"
             raise ValueError(msg)
         super().__init__(message)
         self.message: str = message
         self.code: int = code
+        self.data: Any = data
+
+    @property
+    def payload(self) -> Any:  # noqa: ANN401
+        """Error payload sent in the reply"""
+        return self.message if self.data is None else self.data
+
+
+@dataclass
+class RpcRequest:
+    """RPC call handled by `Nats.serve_dispatch()`"""
+
+    method: str  # subject without the "rpc." prefix
+    args: list[Any]
+    kwargs: dict[str, Any]
+    headers: dict[str, str]
+
+
+RpcDispatcher = Callable[[RpcRequest], Any]
 
 
 def short_repr(value: Any) -> str:  # noqa: ANN401
@@ -75,7 +99,9 @@ def parse_reply(payload: bytes) -> Any:  # noqa: ANN401
         raise RpcError(msg)
     status, result = data
     if status != RPC_OK:
-        raise RpcError(str(result), code=status)
+        if isinstance(result, str):
+            raise RpcError(result, code=status)
+        raise RpcError(str(result), code=status, data=result)
     return result
 
 

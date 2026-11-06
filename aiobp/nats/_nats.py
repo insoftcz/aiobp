@@ -3,7 +3,7 @@
 import asyncio
 import re
 import socket
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, overload
@@ -15,16 +15,18 @@ from nats.js import errors as js_errors
 from nats.js.api import ConsumerConfig
 
 from aiobp.logging import log
-from aiobp.nats._bucket import Bucket, K, V
-from aiobp.nats._common import EventHandler, encoder, invoke, wants_headers
+from aiobp.nats._bucket import Bucket, BucketInfo, K, V
+from aiobp.nats._common import Encoder, EventHandler, encoder, invoke, wants_headers
 from aiobp.nats._consumer import Consumer
 from aiobp.nats._events import EventQueue, EventSubscription, HandlerOptions
 from aiobp.nats._rpc import (
     RPC_OK,
     RPC_PREFIX,
+    RpcDispatcher,
     RpcError,
     RpcHandler,
     RpcProxy,
+    RpcRequest,
     log_call,
     parse_reply,
     parse_request,
@@ -39,6 +41,10 @@ if TYPE_CHECKING:
 # JetStream consumer names may not contain whitespace, ".", "*", ">" or path separators.
 _INVALID_DURABLE_CHARS = re.compile(r"[\s.*>/\\]")
 
+_KV_STREAM_PREFIX = "KV_"  # JetStream stream of key-value bucket "x" is named "KV_x"
+
+ConnectedHandler = Callable[[], Awaitable[None] | None]
+
 
 @dataclass
 class NatsConfig:
@@ -50,10 +56,16 @@ class NatsConfig:
     url: str = "nats://127.0.0.1:4222"
 
 
+_default_encode: Encoder = encoder.encode
+
+
 class Nats:
     """NATS message bus connector
 
-    Payloads are JSON (msgspec, so `msgspec.Struct` works too). The connection
+    Payloads are JSON (msgspec, so `msgspec.Struct` works too). Pass `encoder` to
+    produce outgoing payloads differently, e.g. to keep the wire format of an existing
+    system; it must raise `TypeError` or `ValueError` for a value it can't encode.
+    Incoming payloads are always decoded by msgspec. The connection
     reconnects forever, never receives its own published messages (`no_echo`)
     and is drained on graceful shutdown.
 
@@ -63,21 +75,29 @@ class Nats:
       or `[code, message]` on failure, sent to subject `rpc.<method>`
     - JetStream: `consume()` for durable work queues, `bucket()` for key-value storage
 
+    `on_connected` is called after `connect()` and after every reconnect, e.g. to
+    resynchronize state with other services. Subscriptions survive reconnects on
+    their own, there is no need to subscribe again.
+
     `client` and `jetstream` expose the underlying nats-py objects for anything else.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - keyword-only options
         self,
         service_name: str,
         config: NatsConfig,
         *,
         location: str | None = None,
         rpc_timeout: float = 2.0,
+        encoder: Encoder | None = None,
+        on_connected: ConnectedHandler | None = None,
     ) -> None:
         self._service_name: str = service_name
         self._connection_name: str = f"{service_name}@{location or socket.getfqdn()}"
         self._servers: list[str] = [url.strip() for url in config.url.split(",")]
         self._rpc_timeout: float = rpc_timeout
+        self._encode: Encoder = encoder if encoder is not None else _default_encode
+        self._on_connected: ConnectedHandler | None = on_connected
         self._client: Client = Client()
         self._js: JetStreamContext = self._client.jetstream()
         self._subscriptions: dict[tuple[str, str], EventSubscription] = {}  # by (subject, queue)
@@ -130,6 +150,7 @@ class Nats:
         self._events.start()
         on_shutdown(self.disconnect)
         log.info("Connected to NATS as %s", self._connection_name)
+        await self._call_on_connected()
 
     async def disconnect(self) -> None:
         """Finish in-flight work, then drain and close the connection
@@ -171,12 +192,23 @@ class Nats:
 
     async def _on_reconnected(self) -> None:
         log.info("Connection to NATS server reestablished: %s", self._client.connected_url)
+        if self._on_connected is not None:
+            # nats-py awaits this callback inside its reconnect procedure, don't hold it up
+            create_task(self._call_on_connected(), "NATS on_connected")
+
+    async def _call_on_connected(self) -> None:
+        if self._on_connected is None:
+            return
+        try:
+            await invoke(self._on_connected)
+        except Exception:  # noqa: BLE001 - a failing hook must not break the connection
+            log.trace("NATS on_connected handler failed")
 
     # --- events ---
 
     async def publish(self, subject: str, data: Any, *, headers: dict[str, str] | None = None) -> None:  # noqa: ANN401
         """Publish event, `bytes` are sent as they are, anything else is encoded as JSON"""
-        payload = data if isinstance(data, bytes) else encoder.encode(data)
+        payload = data if isinstance(data, bytes) else self._encode(data)
         await self._client.publish(subject, payload, headers=headers)
 
     async def subscribe(
@@ -274,16 +306,45 @@ class Nats:
         nobody serves the method or it didn't reply within `timeout` (default is
         `rpc_timeout` of the constructor).
         """
-        payload = encoder.encode((args, kwargs or {}))
+        payload = self._encode((args, kwargs or {}))
         return parse_reply(await self.request(RPC_PREFIX + method, payload, timeout=timeout))
 
-    async def serve(self, method: str, handler: RpcHandler) -> None:
+    async def serve(self, method: str, handler: RpcHandler, *, broadcast: bool = False) -> None:
         """Handle RPC calls of `method` by `handler(*args, **kwargs)`
 
         The return value (JSON serializable) is sent back as the result. Calls run
         concurrently. All instances of this service share a queue group, so each call
         is handled by exactly one of them.
+
+        With `broadcast`, every instance of this service handles every call and the
+        caller gets the reply of the fastest one. Use it only when that is intended,
+        any side effect of the call happens on all instances.
         """
+
+        async def run(msg: Msg) -> None:
+            await self._handle_rpc(msg, method, lambda args, kwargs: invoke(handler, *args, **kwargs))
+
+        await self._serve(method, run, broadcast=broadcast)
+
+    async def serve_dispatch(self, pattern: str, dispatcher: RpcDispatcher, *, broadcast: bool = False) -> None:
+        """Handle RPC calls of all methods matching `pattern` by `dispatcher(request)`
+
+        `pattern` may contain wildcards (`*`, `>`), e.g. `"ucs.>"`. The dispatcher gets
+        an `RpcRequest` with the called method, arguments and NATS headers of the call,
+        and its return value is sent back as the result. Raise `RpcError` for an
+        unknown method. `broadcast` works like in `serve()`.
+        """
+
+        async def run(msg: Msg) -> None:
+            method = msg.subject.removeprefix(RPC_PREFIX)
+            headers = msg.headers or {}
+            await self._handle_rpc(
+                msg, method, lambda args, kwargs: invoke(dispatcher, RpcRequest(method, args, kwargs, headers)),
+            )
+
+        await self._serve(pattern, run, broadcast=broadcast)
+
+    async def _serve(self, method: str, run: Callable[[Msg], Coroutine[Any, Any, None]], *, broadcast: bool) -> None:
         self._check_connected()
         subject = RPC_PREFIX + method
         if subject in self._rpc_subscriptions:
@@ -291,30 +352,34 @@ class Nats:
             raise ValueError(msg)
 
         async def on_request(msg: Msg) -> None:
-            task = create_task(self._handle_rpc(msg, method, handler), f"RPC[{method}]")
+            task = create_task(run(msg), f"RPC[{msg.subject.removeprefix(RPC_PREFIX)}]")
             self._rpc_tasks.add(task)
             task.add_done_callback(self._rpc_tasks.discard)
 
-        self._rpc_subscriptions[subject] = await self._client.subscribe(
-            subject, queue=self._service_name, cb=on_request,
-        )
+        queue = "" if broadcast else self._service_name
+        self._rpc_subscriptions[subject] = await self._client.subscribe(subject, queue=queue, cb=on_request)
         await self._sync_subscriptions()
-        log.debug("Serving RPC method %s", method)
+        log.debug("Serving RPC method %s%s", method, " (broadcast)" if broadcast else "")
 
-    async def _handle_rpc(self, msg: Msg, method: str, handler: RpcHandler) -> None:
+    async def _handle_rpc(
+        self,
+        msg: Msg,
+        method: str,
+        call_handler: Callable[[list[Any], dict[str, Any]], Awaitable[Any]],
+    ) -> None:
         try:
             args, kwargs = parse_request(msg.data)
         except RpcError as error:
             log.warning("%s: %s", method, error.message)
-            await self._reply(msg, error.code, error.message)
+            await self._reply(msg, error.code, error.payload)
             return
 
         call = log_call(method, args, kwargs)
         try:
-            result = await invoke(handler, *args, **kwargs)
+            result = await call_handler(args, kwargs)
         except RpcError as error:
-            log.warning("%s -> RpcError(%s)", call, error.message)
-            await self._reply(msg, error.code, error.message)
+            log.warning("%s -> RpcError(%s)", call, short_repr(error.payload))
+            await self._reply(msg, error.code, error.payload)
             return
         except Exception:  # noqa: BLE001 - reply instead of leaving the caller to time out
             log.trace("%s failed", call)
@@ -327,10 +392,10 @@ class Nats:
 
     async def _reply(self, msg: Msg, code: int, result: Any) -> None:  # noqa: ANN401
         try:
-            payload = encoder.encode((code, result))
-        except TypeError:
+            payload = self._encode((code, result))
+        except (TypeError, ValueError):
             log.trace("RPC %s returned value that can't be encoded to JSON", msg.subject)
-            payload = encoder.encode((0, "Internal error"))
+            payload = self._encode((0, "Internal error"))
         await msg.respond(payload)
 
     # --- JetStream ---
@@ -445,8 +510,27 @@ class Nats:
             kv = await self._js.create_key_value(bucket=name, ttl=ttl)
             log.info("Created key-value bucket %s", name)
 
-        self._buckets[name] = bucket = Bucket(kv, value_type=value_type, key_type=key_type)
+        self._buckets[name] = bucket = Bucket(kv, value_type=value_type, key_type=key_type, encode=self._encode)
         return bucket
+
+    async def buckets(self) -> list[BucketInfo]:
+        """List all key-value buckets, sorted by name"""
+        self._check_connected()
+        buckets: list[BucketInfo] = []
+        offset = 0
+        while page := await self._js.streams_info(offset=offset):  # the server sends a limited number per request
+            offset += len(page)
+            for info in page:
+                if not info.config.name or not info.config.name.startswith(_KV_STREAM_PREFIX):
+                    continue
+                buckets.append(BucketInfo(
+                    name=info.config.name.removeprefix(_KV_STREAM_PREFIX),
+                    messages=info.state.messages,
+                    bytes=info.state.bytes,
+                    history=info.config.max_msgs_per_subject,
+                    ttl=info.config.max_age or None,
+                ))
+        return sorted(buckets, key=lambda bucket: bucket.name)
 
     async def delete_bucket(self, name: str) -> None:
         """Delete key-value bucket `name` with all its keys"""
